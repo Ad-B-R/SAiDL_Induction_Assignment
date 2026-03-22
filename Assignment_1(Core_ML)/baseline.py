@@ -156,7 +156,6 @@ class StandardAttention(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-
 class DecoderOnlyTransformer(nn.Module):
     def __init__(self, vocab_size: int, d_model: int, seq_len: int, h: int, d_ff: int, num_layers: int, dropout: float):
         super().__init__()
