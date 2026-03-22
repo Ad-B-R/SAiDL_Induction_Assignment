@@ -211,7 +211,7 @@ def train(cfg: DictConfig):
         dropout=cfg.dropout
     ).to(device)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=5e-5)
     loss_fn = nn.CrossEntropyLoss()
     print("Starting Training Loop...")
     for epoch in range(cfg.epochs):
