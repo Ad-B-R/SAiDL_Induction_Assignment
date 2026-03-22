@@ -1,4 +1,3 @@
-import tiktoken
 import torch
 import torch.nn as nn
 import wandb
@@ -6,6 +5,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
+from data import create_dataloader
 
 class InputEmbedding(nn.Module):
     def __init__(self, d_model: int, vocab_size: int, ):
@@ -191,19 +191,73 @@ def run_validation(model, dataloader, device):
     return perplexity
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig):
-    
-    wandb.init(project="transformer-study", config=OmegaConf.to_container(cfg, resolve=True))
+def train(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    wandb.init(
+        project="transformer-wikitext",
+        config=OmegaConf.to_container(cfg, resolve=True)
+    )
+    train_loader = create_dataloader(cfg, split="train", shuffle=True)
+    val_loader = create_dataloader(cfg, split="validation", shuffle=False)
     
-    if cfg.attention.type == "standard":
-        attention_module = StandardAttention(cfg.d_model, cfg.attention.num_heads)
-    model = DecoderOnlyTransformer(vocab_size=cfg.vocab_size, d_model=cfg.d_model, attention_block=attention_module).to(device)
+    model = DecoderOnlyTransformer(
+        vocab_size=cfg.vocab_size,
+        d_model=cfg.d_model,
+        seq_len=cfg.seq_len,
+        h=cfg.h,
+        d_ff=cfg.d_ff,
+        num_layers=cfg.num_layers,
+        dropout=cfg.dropout
+    ).to(device)
     
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
+    loss_fn = nn.CrossEntropyLoss()
     
     for epoch in range(cfg.epochs):
-        pass
+        model.train()
+        for idx, batch in enumerate(train_loader):
+            x = batch["input_ids"].to(device)
+            y = batch["labels"].to(device)
+            
+            optimizer.zero_grad()
+            logits = model(x)
+            
+            logits = logits.view(-1, cfg.vocab_size)
+            y = y.view(-1)
+            
+            loss = loss_fn(logits, y)
+            loss.backward()
+            optimizer.step()
+            wandb.log({"train_loss": loss.item()})
+            print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f}")
+            
+        model.eval()
+        total_val_loss = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                x = batch["input_ids"].to(device)
+                y = batch["labels"].to(device)
+                
+                logits = model(x)
+                
+                logits = logits.view(-1, cfg.vocab_size)
+                y = y.view(-1)
+                
+                loss = loss_fn(logits, y)
+                total_val_loss += loss.item()
+                
+        avg_val_loss = total_val_loss / len(val_loader)
+        perplexity = math.exp(avg_val_loss)
+        
+        print(f"Epoch {epoch+1} | Val Loss: {avg_val_loss:.4f} | Val Perplexity: {perplexity:.4f}")
+        wandb.log({
+            "val_loss": avg_val_loss,
+            "val_perplexity": perplexity,
+            "epoch": epoch + 1
+        })
+        
+    wandb.finish()
 
 if __name__ == "__main__":
-    main()
+    train()
