@@ -121,14 +121,71 @@ class ResidualConnections(nn.Module):
     def forward(self, x, sublayer):
         return x + self.dropout(sublayer(self.norm(x)))
     
+class AttentionBlock(nn.Module):
+    def __init__(self, features, self_attention_block: MultiHeadAttention, feed_forward_block: FeedForwardNetwork,
+                 dropout: float, ):
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.feed_foward_network = feed_forward_block
+        self.dropout = dropout
+        self.residual_connections = nn.ModuleList([ResidualConnections(features, dropout) for _ in range(2)])
+
+    def forward(self, x, src_mask):
+        # Residual_connections stores residual blocks, 
+        # hence following means ResidualConnections.forward(x, sublayer)
+        x = self.residual_connections[0](x, 
+            lambda x: self.self_attention_block(x,src_mask))
+        # residual_connections__Call__() expects only one input function, hence we do this
+        x = self.residual_connections[1](x, self.feed_foward_network)
+        return x
+    
 class StandardAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
+    def __init__(self, features, layers: nn.ModuleList):
         super().__init__()
+        self.layers = layers
+        self.norm = LayerNorm(features)
+    
+    def forward(self, x, mask=None):
+        if mask is None:
+            batch_size, seq_len = x.shape[0], x.shape[1]
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            mask = mask.expand(batch_size, 1, seq_len, seq_len)
 
-class GPT(nn.Module):
-    def __init__(self, vocab_size, d_model, attention_block):
+        for layer in self.layers:
+            x = layer(x, mask)
+        return self.norm(x)
+
+
+class DecoderOnlyTransformer(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, seq_len: int, h: int, d_ff: int, num_layers: int, dropout: float):
         super().__init__()
-
+        
+        self.embedding = InputEmbedding(d_model, vocab_size)
+        self.pos_encoding = PositionalEncoding(d_model, seq_len, dropout)
+        
+        layers = nn.ModuleList([
+            AttentionBlock(
+                features=d_model,
+                self_attention_block=MultiHeadAttention(d_model, h, dropout),
+                feed_forward_block=FeedForwardNetwork(d_model, d_ff, dropout),
+                dropout=dropout
+            ) for _ in range(num_layers)
+        ])
+        
+        self.transformer = StandardAttention(d_model, layers)
+        
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        
+    def forward(self, x):
+        x = self.embedding(x)
+        x = self.pos_encoding(x)
+        
+        x = self.transformer(x, mask=None) 
+        
+        # Output shape: (batch_size, seq_len, vocab_size)
+        return self.lm_head(x)
+    
 def run_validation(model, dataloader, device):
     perplexity = 0.0
     return perplexity
@@ -141,7 +198,7 @@ def main(cfg: DictConfig):
     
     if cfg.attention.type == "standard":
         attention_module = StandardAttention(cfg.d_model, cfg.attention.num_heads)
-    model = GPT(vocab_size=cfg.vocab_size, d_model=cfg.d_model, attention_block=attention_module).to(device)
+    model = DecoderOnlyTransformer(vocab_size=cfg.vocab_size, d_model=cfg.d_model, attention_block=attention_module).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
     

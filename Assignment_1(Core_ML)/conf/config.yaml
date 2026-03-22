@@ -1,0 +1,11 @@
+defaults:
+  - attention: standard    
+  - positional: standard   
+  - _self_                 # Tells Hydra to allow the variables below to override defaults
+
+dataset: "wikitext-2"
+seq_len: 1024
+batch_size: 64
+learning_rate: 3e-4
+epochs: 10
+d_model: 512
