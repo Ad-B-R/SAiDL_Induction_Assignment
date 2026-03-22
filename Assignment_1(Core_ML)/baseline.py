@@ -213,7 +213,7 @@ def train(cfg: DictConfig):
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
     loss_fn = nn.CrossEntropyLoss()
-    
+    print("Starting Training Loop...")
     for epoch in range(cfg.epochs):
         model.train()
         for idx, batch in enumerate(train_loader):
@@ -229,8 +229,9 @@ def train(cfg: DictConfig):
             loss = loss_fn(logits, y)
             loss.backward()
             optimizer.step()
-            wandb.log({"train_loss": loss.item()})
-            print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f}")
+            if idx%20==0:
+                wandb.log({"train_loss": loss.item()})
+                print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f}")
             
         model.eval()
         total_val_loss = 0
