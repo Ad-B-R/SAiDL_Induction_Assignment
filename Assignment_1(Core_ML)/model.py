@@ -6,8 +6,10 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
-import baseline
+from attention import baseline
+from positional import sine_cosine
 
+# calculate the throughput
 class InputEmbedding(nn.Module):
     def __init__(self, d_model: int, vocab_size: int, ):
         super().__init__()
@@ -75,7 +77,7 @@ class DecoderOnlyTransformer(nn.Module):
         
         self.embedding = InputEmbedding(cfg.d_model, cfg.vocab_size)
         if True:
-            self.pos_encoding = baseline.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
+            self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
             
 
         if True:
