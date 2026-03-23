@@ -6,8 +6,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
-from attention import baseline, Sliding_Window
+from attention import baseline, Sliding_Window, GQA
 from positional import sine_cosine
+
 
 # calculate the throughput
 class InputEmbedding(nn.Module):
@@ -82,6 +83,9 @@ class DecoderOnlyTransformer(nn.Module):
             
 
         if True:
+            attention_math = GQA.GroupedQueryAttention
+            attention_body = GQA.StandardAttention
+        elif False: 
     #   if cfg.attention.type == "sliding_window":
             attention_math = Sliding_Window.SlidingWindowAttention
             attention_body = Sliding_Window.StandardAttention

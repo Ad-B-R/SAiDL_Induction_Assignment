@@ -7,6 +7,9 @@ from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
 
+# Run for different context lengths and throughput
+
+
 class LayerNorm(nn.Module):
     def __init__(self, features:int, eps: float = 10**-6):
         super().__init__()

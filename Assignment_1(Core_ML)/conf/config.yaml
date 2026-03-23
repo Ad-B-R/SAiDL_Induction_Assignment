@@ -15,4 +15,7 @@ h: 4
 d_ff: 1024         
 num_layers: 4      
 dropout: 0.1   
+
 window_size: 128
+
+h_GQA: 2

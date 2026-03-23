@@ -7,7 +7,6 @@ from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
 
-# Run for different context lengths
 
 class LayerNorm(nn.Module):
     def __init__(self, features:int, eps: float = 10**-6):
@@ -22,17 +21,15 @@ class LayerNorm(nn.Module):
         return self.gamma * (x-mean)/(std + self.eps) + self.beta
     
 class StandardAttention(nn.Module):
-    def __init__(self, features, layers: nn.ModuleList, window=64):
+    def __init__(self, features, layers: nn.ModuleList, **kwargs):
         super().__init__()
         self.layers = layers
         self.norm = LayerNorm(features)
-        self.window = window
-
+    
     def forward(self, x, mask=None):
         if mask is None:
             batch_size, seq_len = x.shape[0], x.shape[1]
             mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device))
-            mask = torch.triu(mask, diagonal=-self.window + 1) 
             mask = mask.unsqueeze(0).unsqueeze(0)
             mask = mask.expand(batch_size, 1, seq_len, seq_len)
 
@@ -40,7 +37,7 @@ class StandardAttention(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-class SlidingWindowAttention(nn.Module):
+class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model: int, h:int, dropout:float):
         super().__init__()
         self.d_model = d_model
@@ -83,7 +80,7 @@ class SlidingWindowAttention(nn.Module):
         value = value.view(value.shape[0], -1, self.h, self.d_k).transpose(1,2)
 
         # (batch, h, seq_len, d_k) 
-        x, self.attention_scores = SlidingWindowAttention.attention(query, key, value, mask, self.dropout)
+        x, self.attention_scores = GroupedQueryAttention.attention(query, key, value, mask, self.dropout)
 
         x = x.transpose(1,2)
         x = x.contiguous().view(x.shape[0], -1, self.h*self.d_k)
