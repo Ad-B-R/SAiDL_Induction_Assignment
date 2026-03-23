@@ -1,17 +1,18 @@
 defaults:
-  - attention: standard    
-  - positional: standard   
+  - attention: Sliding_Window    
+  - positional: Standard   
   - _self_                 
 
 dataset: "wikitext-2"
 seq_len: 256
 batch_size: 4
 lr: 3e-4
-epochs: 5
+epochs: 2
 
 vocab_size: 50257  
 d_model: 256
 h: 4               
 d_ff: 1024         
 num_layers: 4      
-dropout: 0.1       
+dropout: 0.1   
+window_size: 128

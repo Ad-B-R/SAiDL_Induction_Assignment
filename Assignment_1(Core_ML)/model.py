@@ -6,7 +6,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
-from attention import baseline
+from attention import baseline, Sliding_Window
 from positional import sine_cosine
 
 # calculate the throughput
@@ -76,17 +76,19 @@ class DecoderOnlyTransformer(nn.Module):
         super().__init__()
         
         self.embedding = InputEmbedding(cfg.d_model, cfg.vocab_size)
+        w = None
         if True:
             self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
             
 
         if True:
-                attention_math = baseline.MultiHeadAttention
-                attention_body = baseline.StandardAttention
-
-        elif cfg.attention.type == "linear":
-            # attn_math = LinearAttention(cfg.d_model, cfg.attention.h, cfg.dropout)
-            pass
+    #   if cfg.attention.type == "sliding_window":
+            attention_math = Sliding_Window.SlidingWindowAttention
+            attention_body = Sliding_Window.StandardAttention
+            w = cfg.window_size
+        else:
+            attention_math = baseline.MultiHeadAttention
+            attention_body = baseline.StandardAttention
 
         layers = nn.ModuleList([
             AttentionBlock(
@@ -96,7 +98,7 @@ class DecoderOnlyTransformer(nn.Module):
                 dropout=cfg.dropout
             ) for _ in range(cfg.num_layers)
         ])
-        self.transformer = attention_body(cfg.d_model, layers)
+        self.transformer = attention_body(cfg.d_model, layers, window=w)
         
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
         
