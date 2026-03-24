@@ -78,22 +78,27 @@ class DecoderOnlyTransformer(nn.Module):
         super().__init__()
         
         self.embedding = InputEmbedding(cfg.d_model, cfg.vocab_size)
-        w = None
-        h_GQA = None
+        # Set to none if they dont exist
+        w = cfg.attention.get("window_size", None)
+        h_GQA = cfg.attention.get("h_GQA", None)
+
+        attention_type = cfg.attention.get("type", "Standard")
+        pos_encoding_type = cfg.attention.get("type", "Standard")
         if True:
             self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
             
 
-        if True:
+        if attention_type=="GQA":
             attention_math = GQA.GroupedQueryAttention
             attention_body = GQA.StandardAttention
 
-            h_GQA = cfg.h_GQA
-        elif False: 
-    #   if cfg.attention.type == "sliding_window":
+            print(f"GQA no of Group heads: {h_GQA}")
+
+        elif attention_type=="Sliding": 
             attention_math = Sliding_Window.SlidingWindowAttention
             attention_body = Sliding_Window.StandardAttention
-            w = cfg.window_size
+
+            print(f"Window Size: {w}")
         else:
             attention_math = baseline.MultiHeadAttention
             attention_body = baseline.StandardAttention
@@ -160,7 +165,7 @@ def train(cfg: DictConfig):
             optimizer.step()
             tokens_processed += (x.shape[0] * x.shape[1])
             
-            if idx % 20 == 0: 
+            if idx % 20 == 0 and idx!=0: 
                 elapsed_time = time.time() - start_time
                 throughput = tokens_processed / elapsed_time
                 
