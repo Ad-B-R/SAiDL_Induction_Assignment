@@ -5,8 +5,6 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from datasets import load_dataset
 
-Run for different context lengths
-
 
 class GeneralizedDataset(Dataset):
     def __init__(self, seq_len: int, split: str = "train"):

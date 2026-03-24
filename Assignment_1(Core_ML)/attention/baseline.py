@@ -40,7 +40,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float):
+    def __init__(self, d_model: int, h:int, dropout:float, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.h = h

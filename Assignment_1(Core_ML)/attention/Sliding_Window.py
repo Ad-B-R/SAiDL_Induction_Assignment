@@ -22,7 +22,7 @@ class LayerNorm(nn.Module):
         return self.gamma * (x-mean)/(std + self.eps) + self.beta
     
 class StandardAttention(nn.Module):
-    def __init__(self, features, layers: nn.ModuleList, window=64):
+    def __init__(self, features, layers: nn.ModuleList, window=64, **kwargs):
         super().__init__()
         self.layers = layers
         self.norm = LayerNorm(features)
@@ -41,7 +41,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class SlidingWindowAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float):
+    def __init__(self, d_model: int, h:int, dropout:float, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.h = h

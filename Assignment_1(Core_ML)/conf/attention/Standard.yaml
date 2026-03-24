@@ -1,4 +1,0 @@
-# conf/attention/standard.yaml
-type: "standard"
-num_heads: 8
-dropout: 0.1

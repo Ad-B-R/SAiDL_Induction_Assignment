@@ -38,17 +38,22 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float):
+    def __init__(self, d_model: int, h:int, dropout:float, h_GQA: int):
         super().__init__()
         self.d_model = d_model
         self.h = h
         self.dropout = dropout
+        self.h_kv = h_GQA
+
+        self.num_groups_per_head = h//h_GQA
+
         assert d_model%h == 0,  "d_model not divisible by h"
+        assert h%h_GQA==0, "No of heads must be divisible by initial number of heads"
 
         self.d_k = d_model//h
         self.Wq = nn.Linear(d_model, d_model)
-        self.Wk = nn.Linear(d_model, d_model)
-        self.Wv = nn.Linear(d_model, d_model)
+        self.Wk = nn.Linear(d_model, h_GQA*self.d_k)
+        self.Wv = nn.Linear(d_model, h_GQA*self.d_k)
         
         self.Wo = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
@@ -75,9 +80,12 @@ class GroupedQueryAttention(nn.Module):
         key = self.Wk(x)
         # batch, seq_len, h, d_k -> batch, h, seq_len, d_k
         query = query.view(query.shape[0], -1, self.h, self.d_k).transpose(1,2)
-        key = key.view(key.shape[0], -1, self.h, self.d_k).transpose(1,2)
+        key = key.view(key.shape[0], -1, self.h_kv, self.d_k).transpose(1,2)
         # key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).permute([0,2,1,3])
-        value = value.view(value.shape[0], -1, self.h, self.d_k).transpose(1,2)
+        value = value.view(value.shape[0], -1, self.h_kv, self.d_k).transpose(1,2)
+        
+        key = key.repeat_interleave(self.num_groups_per_head, dim=1)
+        value = value.repeat_interleave(self.num_groups_per_head, dim=1)
 
         # (batch, h, seq_len, d_k) 
         x, self.attention_scores = GroupedQueryAttention.attention(query, key, value, mask, self.dropout)

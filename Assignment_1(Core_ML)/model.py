@@ -6,8 +6,9 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
-from attention import baseline, Sliding_Window, GQA
-from positional import sine_cosine
+from attention import baseline, Sliding_Window, GQA, Softmax
+from positional import sine_cosine, rope, rpe, alibi
+import time
 
 
 # calculate the throughput
@@ -78,6 +79,7 @@ class DecoderOnlyTransformer(nn.Module):
         
         self.embedding = InputEmbedding(cfg.d_model, cfg.vocab_size)
         w = None
+        h_GQA = None
         if True:
             self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
             
@@ -85,6 +87,8 @@ class DecoderOnlyTransformer(nn.Module):
         if True:
             attention_math = GQA.GroupedQueryAttention
             attention_body = GQA.StandardAttention
+
+            h_GQA = cfg.h_GQA
         elif False: 
     #   if cfg.attention.type == "sliding_window":
             attention_math = Sliding_Window.SlidingWindowAttention
@@ -97,7 +101,7 @@ class DecoderOnlyTransformer(nn.Module):
         layers = nn.ModuleList([
             AttentionBlock(
                 features=cfg.d_model,
-                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout),
+                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA),
                 feed_forward_block=FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout),
                 dropout=cfg.dropout
             ) for _ in range(cfg.num_layers)
@@ -137,6 +141,10 @@ def train(cfg: DictConfig):
     print("Starting Training Loop...")
     for epoch in range(cfg.epochs):
         model.train()
+        
+        start_time = time.time()
+        tokens_processed = 0
+        
         for idx, batch in enumerate(train_loader):
             x = batch["input_ids"].to(device)
             y = batch["labels"].to(device)
@@ -150,9 +158,21 @@ def train(cfg: DictConfig):
             loss = loss_fn(logits, y)
             loss.backward()
             optimizer.step()
-            if idx%20==0:
-                wandb.log({"train_loss": loss.item()})
-                print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f}")
+            tokens_processed += (x.shape[0] * x.shape[1])
+            
+            if idx % 20 == 0: 
+                elapsed_time = time.time() - start_time
+                throughput = tokens_processed / elapsed_time
+                
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "throughput_tok_sec": throughput 
+                })
+                
+                print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f} | Throughput: {throughput:.0f} tok/s")
+                
+                start_time = time.time()
+                tokens_processed = 0
             
         model.eval()
         total_val_loss = 0
