@@ -77,13 +77,17 @@ class DecoderOnlyTransformer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         
+        # Debugging
+        print(OmegaConf.to_yaml(cfg))
+
         self.embedding = InputEmbedding(cfg.d_model, cfg.vocab_size)
+        
         # Set to none if they dont exist
         w = cfg.attention.get("window_size", None)
         h_GQA = cfg.attention.get("h_GQA", None)
 
         attention_type = cfg.attention.get("type", "Standard")
-        pos_encoding_type = cfg.attention.get("type", "Standard")
+        pos_encoding_type = cfg.positional.get("type", "Standard")
         if True:
             self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
             
@@ -103,6 +107,7 @@ class DecoderOnlyTransformer(nn.Module):
             attention_math = baseline.MultiHeadAttention
             attention_body = baseline.StandardAttention
 
+            print("Standard Attention being used")
         layers = nn.ModuleList([
             AttentionBlock(
                 features=cfg.d_model,
