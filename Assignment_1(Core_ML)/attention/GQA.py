@@ -38,7 +38,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class GroupedQueryAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float, h_GQA: int, use_rope: bool = False, **kwargs):
+    def __init__(self, d_model: int, h:int, dropout:float, h_GQA: int, pos_encoding_fn, use_rope: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -57,7 +57,10 @@ class GroupedQueryAttention(nn.Module):
         
         self.Wo = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-    
+
+        # In case rope is used
+        self.use_rope = use_rope
+        self.pos_encoding_fn = pos_encoding_fn
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):
         d_k = query.shape[-1]
@@ -83,7 +86,11 @@ class GroupedQueryAttention(nn.Module):
         key = key.view(key.shape[0], -1, self.h_kv, self.d_k).transpose(1,2)
         # key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).permute([0,2,1,3])
         value = value.view(value.shape[0], -1, self.h_kv, self.d_k).transpose(1,2)
-        
+        # Before interleave because it has to remain intact
+        if self.use_rope:
+            # print("Successfully reached this fn")
+            query, key = self.pos_encoding_fn(query, key)
+
         key = key.repeat_interleave(self.num_groups_per_head, dim=1)
         value = value.repeat_interleave(self.num_groups_per_head, dim=1)
 

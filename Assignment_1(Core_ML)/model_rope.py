@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
 from attention import baseline, Sliding_Window, GQA, Softmax
-from positional import sine_cosine, rope, rpe, alibi
+from positional import rope
 import time
 
 
@@ -87,13 +87,8 @@ class DecoderOnlyTransformer(nn.Module):
         h_GQA = cfg.attention.get("h_GQA", None)
 
         attention_type = cfg.attention.get("type", "Standard")
-        pos_encoding_type = cfg.positional.get("type", "Standard")
-        if True:
-            self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
-        else:
-            # RoPE
-            pass
-            
+        
+        rope_fn = rope.apply_rope
 
         if attention_type=="GQA":
             attention_math = GQA.GroupedQueryAttention
@@ -119,7 +114,7 @@ class DecoderOnlyTransformer(nn.Module):
         layers = nn.ModuleList([
             AttentionBlock(
                 features=cfg.d_model,
-                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA),
+                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA, pos_encoding_fn=rope_fn, use_rope=True),
                 feed_forward_block=FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout),
                 dropout=cfg.dropout
             ) for _ in range(cfg.num_layers)
@@ -130,7 +125,6 @@ class DecoderOnlyTransformer(nn.Module):
         
     def forward(self, x):
         x = self.embedding(x)
-        x = self.pos_encoding(x)
         
         x = self.transformer(x, mask=None) 
         
@@ -188,7 +182,7 @@ def train(cfg: DictConfig):
 
             wandb.init(
                 project="transformer-master-ablation", 
-                name=f"{attn}_seq_{cfg.seq_len}",         
+                name=f"{attn}_seq_{cfg.seq_len}_RoPE",         
                 config=OmegaConf.to_container(cfg, resolve=True),
                 reinit=True 
             )

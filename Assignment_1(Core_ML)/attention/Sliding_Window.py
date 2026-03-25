@@ -41,7 +41,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class SlidingWindowAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float, **kwargs):
+    def __init__(self, d_model: int, h:int, dropout:float, pos_encoding_fn, use_rope: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -55,11 +55,14 @@ class SlidingWindowAttention(nn.Module):
         
         self.Wo = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-    
+
+        # In case rope is used
+        self.use_rope = use_rope
+        self.pos_encoding_fn = pos_encoding_fn
+
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):
         d_k = query.shape[-1]
-
         # (batch, seq_len, d_k) -> (batch, seq_len, seq_len)
         attention_scores = ((query @ key.transpose(-2,-1))/math.sqrt(d_k))
         if mask is not None:
@@ -81,6 +84,10 @@ class SlidingWindowAttention(nn.Module):
         key = key.view(key.shape[0], -1, self.h, self.d_k).transpose(1,2)
         # key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).permute([0,2,1,3])
         value = value.view(value.shape[0], -1, self.h, self.d_k).transpose(1,2)
+
+        if self.use_rope:
+            # print("Successfully reached this fn")
+            query, key = self.pos_encoding_fn(query, key)
 
         # (batch, h, seq_len, d_k) 
         x, self.attention_scores = SlidingWindowAttention.attention(query, key, value, mask, self.dropout)
