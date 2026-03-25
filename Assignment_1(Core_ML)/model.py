@@ -90,6 +90,9 @@ class DecoderOnlyTransformer(nn.Module):
         pos_encoding_type = cfg.positional.get("type", "Standard")
         if True:
             self.pos_encoding = sine_cosine.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
+        else:
+            # RoPE
+            pass
             
 
         if attention_type=="GQA":
@@ -103,6 +106,11 @@ class DecoderOnlyTransformer(nn.Module):
             attention_body = Sliding_Window.StandardAttention
 
             print(f"Window Size: {w}")
+        elif attention_type=="SoftmaxFree":
+            attention_math = Softmax.MultiHeadAttention
+            attention_body = Softmax.StandardAttention
+
+            print("Softmax-free Attention being used")
         else:
             attention_math = baseline.MultiHeadAttention
             attention_body = baseline.StandardAttention
@@ -129,87 +137,125 @@ class DecoderOnlyTransformer(nn.Module):
         # Output shape: (batch_size, seq_len, vocab_size)
         return self.lm_head(x)
 
-def run_validation(model, dataloader, device):
-    perplexity = 0.0
-    return perplexity
+@torch.no_grad()
+def run_validation(model, dataloader, loss_fn, vocab_size, device, eval_iters=None):
+    model.eval()
+    total_loss = 0.0
+    eval_full = 0
+    for i, batch in enumerate(dataloader):
+        eval_full+=1
+        if eval_iters is not None and i >= eval_iters:
+            break
+        x = batch["input_ids"].to(device)
+        y = batch["labels"].to(device)
+        
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            logits = model(x)
+            logits = logits.view(-1, vocab_size)
+            y = y.view(-1)
+            loss = loss_fn(logits, y)
+
+            
+        total_loss += loss.item()
+        
+    model.train()
+    avg_loss = total_loss / eval_iters if eval_iters != None else total_loss/eval_full
+    perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
+    return avg_loss, perplexity
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def train(cfg: DictConfig):
+    OmegaConf.set_struct(cfg, False) 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    base_seq_len = cfg.seq_len
+    base_batch_size = cfg.batch_size
 
-    wandb.init(
-        project="transformer-wikitext",
-        config=OmegaConf.to_container(cfg, resolve=True)
-    )
-    train_loader = create_dataloader(cfg, split="train", shuffle=True)
-    val_loader = create_dataloader(cfg, split="validation", shuffle=False)
     
-    model = DecoderOnlyTransformer(cfg).to(device)
+    cfg.attention.window_size = getattr(cfg.attention, "window_size", 64)
+    cfg.attention.h_GQA = getattr(cfg.attention, "h_GQA", 2)
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=5e-5)
-    loss_fn = nn.CrossEntropyLoss()
-    print("Starting Training Loop...")
-    for epoch in range(cfg.epochs):
-        model.train()
-        
-        start_time = time.time()
-        tokens_processed = 0
-        
-        for idx, batch in enumerate(train_loader):
-            x = batch["input_ids"].to(device)
-            y = batch["labels"].to(device)
+    attention_types = ["Standard", "GQA", "SoftmaxFree", "Sliding"]
+    multipliers = [1, 2, 3, 4]
+    
+    for attn in attention_types:
+        for mult in multipliers:
+            cfg.attention.type = attn
+            cfg.seq_len = base_seq_len * mult
+            cfg.batch_size = max(1, base_batch_size // mult) 
             
-            optimizer.zero_grad()
-            logits = model(x)
+            print(f"\nSTARTING RUN: {attn} Attention | Seq Len {cfg.seq_len} | Batch {cfg.batch_size}\n")
+
+            wandb.init(
+                project="transformer-master-ablation", 
+                name=f"{attn}_seq_{cfg.seq_len}",         
+                config=OmegaConf.to_container(cfg, resolve=True),
+                reinit=True 
+            )
             
-            logits = logits.view(-1, cfg.vocab_size)
-            y = y.view(-1)
+            train_loader = create_dataloader(cfg, split="train", shuffle=True)
+            val_loader = create_dataloader(cfg, split="validation", shuffle=False)
             
-            loss = loss_fn(logits, y)
-            loss.backward()
-            optimizer.step()
-            tokens_processed += (x.shape[0] * x.shape[1])
+            model = DecoderOnlyTransformer(cfg).to(device)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=5e-5)
+            loss_fn = nn.CrossEntropyLoss()
             
-            if idx % 20 == 0 and idx!=0: 
-                elapsed_time = time.time() - start_time
-                throughput = tokens_processed / elapsed_time
-                
-                wandb.log({
-                    "train_loss": loss.item(),
-                    "throughput_tok_sec": throughput 
-                })
-                
-                print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f} | Throughput: {throughput:.0f} tok/s")
-                
+            scaler = torch.amp.GradScaler("cuda")
+            global_step = 0
+            
+            for epoch in range(cfg.epochs):
+                model.train()
                 start_time = time.time()
                 tokens_processed = 0
-            
-        model.eval()
-        total_val_loss = 0
-        with torch.no_grad():
-            for batch in val_loader:
-                x = batch["input_ids"].to(device)
-                y = batch["labels"].to(device)
                 
-                logits = model(x)
+                for idx, batch in enumerate(train_loader):
+                    x = batch["input_ids"].to(device)
+                    y = batch["labels"].to(device)
+                    
+                    optimizer.zero_grad()
+                    
+                    with torch.autocast(device_type="cuda", dtype=torch.float16):
+                        logits = model(x)
+                        logits = logits.view(-1, cfg.vocab_size)
+                        y = y.view(-1)
+                        loss = loss_fn(logits, y)
+                    
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    tokens_processed += (x.shape[0] * x.shape[1])
+                    global_step += 1
+                    
+                    if idx % 20 == 0 and idx != 0: 
+                        elapsed_time = time.time() - start_time
+                        throughput = tokens_processed / elapsed_time
+                        
+                        wandb.log({
+                            "train_loss": loss.item(),
+                            "throughput_tkn/s": throughput,
+                            "epoch": epoch + (idx / len(train_loader))
+                        }, step=global_step)
+                        
+                        print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f} | Throughput: {throughput:.0f} tkn/s")
+                        
+                        start_time = time.time()
+                        tokens_processed = 0
+                    
+                    if idx % 100 == 0 and idx != 0:
+                        val_loss, val_perplexity = run_validation(model, val_loader, loss_fn, cfg.vocab_size, device, eval_iters=50)
+                        
+                        wandb.log({
+                            "val_loss": val_loss,
+                            "val_perplexity": val_perplexity
+                        }, step=global_step)
+                        
+                        print(f"--- MIDWAY EVAL | Batch {idx} | Val Loss: {val_loss:.4f} | Val Perp: {val_perplexity:.4f} ---")
+                        
+                val_loss, val_perplexity = run_validation(model, val_loader, loss_fn, cfg.vocab_size, device)
+                print(f"Epoch {epoch+1} END | Val Loss: {val_loss:.4f} | Val Perplexity: {val_perplexity:.4f}")
                 
-                logits = logits.view(-1, cfg.vocab_size)
-                y = y.view(-1)
-                
-                loss = loss_fn(logits, y)
-                total_val_loss += loss.item()
-                
-        avg_val_loss = total_val_loss / len(val_loader)
-        perplexity = math.exp(avg_val_loss)
-        
-        print(f"Epoch {epoch+1} | Val Loss: {avg_val_loss:.4f} | Val Perplexity: {perplexity:.4f}")
-        wandb.log({
-            "val_loss": avg_val_loss,
-            "val_perplexity": perplexity,
-            "epoch": epoch + 1
-        })
-        
-    wandb.finish()
+            wandb.finish()
 
 if __name__ == "__main__":
     train()

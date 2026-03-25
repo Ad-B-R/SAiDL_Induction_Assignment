@@ -1,0 +1,2 @@
+type: "RoPE"
+use_rope: True

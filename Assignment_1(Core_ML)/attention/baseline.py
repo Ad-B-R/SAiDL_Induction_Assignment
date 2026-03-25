@@ -40,7 +40,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float, **kwargs):
+    def __init__(self, d_model: int, h:int, dropout:float, use_rope: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -62,7 +62,7 @@ class MultiHeadAttention(nn.Module):
         # (batch, seq_len, d_k) -> (batch, seq_len, seq_len)
         attention_scores = ((query @ key.transpose(-2,-1))/math.sqrt(d_k))
         if mask is not None:
-            attention_scores.masked_fill_(mask==0, -1e9)
+            attention_scores.masked_fill_(mask == 0, float('-inf'))
         attention_scores = attention_scores.softmax(dim=-1) # batch, h, seq_len, seq_len
         if dropout is not None:
             attention_scores = dropout(attention_scores)
