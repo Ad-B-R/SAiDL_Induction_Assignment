@@ -221,7 +221,7 @@ def train(cfg: DictConfig):
                     tokens_processed += (x.shape[0] * x.shape[1])
                     global_step += 1
                     
-                    if idx % 20 == 0 and idx != 0: 
+                    if idx % 20 == 0 and idx != 0 and idx%100!=0: 
                         elapsed_time = time.time() - start_time
                         throughput = tokens_processed / elapsed_time
                         
@@ -237,6 +237,16 @@ def train(cfg: DictConfig):
                         tokens_processed = 0
                     
                     if idx % 100 == 0 and idx != 0:
+                        elapsed_time = time.time() - start_time
+                        throughput = tokens_processed / elapsed_time
+                        
+                        wandb.log({
+                            "train_loss": loss.item(),
+                            "throughput_tkn/s": throughput,
+                            "epoch": epoch + (idx / len(train_loader))
+                        }, step=global_step)
+                        
+                        print(f"Epoch {epoch+1} | Batch {idx} | Train Loss: {loss.item():.4f} | Throughput: {throughput:.0f} tkn/s")
                         val_loss, val_perplexity = run_validation(model, val_loader, loss_fn, cfg.vocab_size, device, eval_iters=50)
                         
                         wandb.log({
@@ -245,6 +255,9 @@ def train(cfg: DictConfig):
                         }, step=global_step)
                         
                         print(f"--- MIDWAY EVAL | Batch {idx} | Val Loss: {val_loss:.4f} | Val Perp: {val_perplexity:.4f} ---")
+
+                        start_time = time.time()
+                        tokens_processed = 0
                         
                 val_loss, val_perplexity = run_validation(model, val_loader, loss_fn, cfg.vocab_size, device)
                 print(f"Epoch {epoch+1} END | Val Loss: {val_loss:.4f} | Val Perplexity: {val_perplexity:.4f}")
