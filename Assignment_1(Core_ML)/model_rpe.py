@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import math
 from data import create_dataloader
 from attention import baseline, Sliding_Window, GQA, Softmax
-from positional import standardpos
+from positional import rpe
 import time
 
 
@@ -87,8 +87,7 @@ class DecoderOnlyTransformer(nn.Module):
         h_GQA = cfg.attention.get("h_GQA", None)
 
         attention_type = cfg.attention.get("type", "Standard")
-        self.pos_encoding = standardpos.PositionalEncoding(cfg.d_model, cfg.seq_len, cfg.dropout)
-        encoding_fn = None
+        rpe_pe = rpe.RelativePositionBias
 
         if attention_type=="GQA":
             attention_math = GQA.GroupedQueryAttention
@@ -114,7 +113,8 @@ class DecoderOnlyTransformer(nn.Module):
         layers = nn.ModuleList([
             AttentionBlock(
                 features=cfg.d_model,
-                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA, pos_encoding_fn=encoding_fn, use_rope=False),
+                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA, 
+                                                    rpe_fn=rpe_pe(cfg.h, cfg.seq_len), use_rpe=True),
                 feed_forward_block=FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout),
                 dropout=cfg.dropout
             ) for _ in range(cfg.num_layers)
@@ -125,7 +125,6 @@ class DecoderOnlyTransformer(nn.Module):
         
     def forward(self, x):
         x = self.embedding(x)
-        x = self.pos_encoding(x)
         
         x = self.transformer(x, mask=None) 
         
@@ -170,9 +169,7 @@ def train(cfg: DictConfig):
     cfg.attention.window_size = getattr(cfg.attention, "window_size", 64)
     cfg.attention.h_GQA = getattr(cfg.attention, "h_GQA", 2)
     
-    attention_types = [
-        # "Standard", "GQA","Sliding",
-                       "SoftmaxFree"]
+    attention_types = ["Standard", "GQA", "SoftmaxFree", "Sliding"]
     multipliers = [1, 2, 3, 4]
     
     for attn in attention_types:
@@ -185,7 +182,7 @@ def train(cfg: DictConfig):
 
             wandb.init(
                 project="transformer-master-ablation", 
-                name=f"{attn}_seq_{cfg.seq_len} abs_pos_enc",         
+                name=f"{attn}_seq_{cfg.seq_len}_RPE_Bias",         
                 config=OmegaConf.to_container(cfg, resolve=True),
                 reinit=True 
             )

@@ -114,7 +114,8 @@ class DecoderOnlyTransformer(nn.Module):
         layers = nn.ModuleList([
             AttentionBlock(
                 features=cfg.d_model,
-                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA, pos_encoding_fn=rope_fn, use_rope=True),
+                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA, 
+                                                    pos_encoding_fn=rope_fn, use_rope=True),
                 feed_forward_block=FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout),
                 dropout=cfg.dropout
             ) for _ in range(cfg.num_layers)
@@ -169,7 +170,8 @@ def train(cfg: DictConfig):
     cfg.attention.window_size = getattr(cfg.attention, "window_size", 64)
     cfg.attention.h_GQA = getattr(cfg.attention, "h_GQA", 2)
     
-    attention_types = ["Standard", "GQA", "SoftmaxFree", "Sliding"]
+    attention_types = ["SoftmaxFree"]
+        # "Standard", "GQA","Sliding",
     multipliers = [1, 2, 3, 4]
     
     for attn in attention_types:

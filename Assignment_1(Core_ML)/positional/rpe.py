@@ -1,25 +1,26 @@
 import torch
 import torch.nn as nn
-import math
 
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, seq_len: int, dropout: float):
+class RelativePositionBias(nn.Module):
+    def __init__(self, num_heads, max_seq_len):
         super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(self.seq_len, d_model)
-        position = torch.arange(0, self.seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float()* 
-                            (-math.log(10000)/self.d_model))
-        pe[:,0::2] = torch.sin(position*div_term)
-        pe[:,1::2] = torch.cos(position*div_term)
-        pe = pe.unsqueeze(0)
+        self.num_heads = num_heads
+        self.max_seq_len = max_seq_len
 
-        self.register_buffer('pe', pe)
+        # distances range: [-(L-1), ..., +(L-1)]
+        self.num_buckets = 2 * max_seq_len - 1
 
-    @torch.no_grad()
-    def forward(self, x):
-        x = x + self.pe[:, :x.shape[1], :] # for different broadcasting purposes
-        return self.dropout(x)
+        self.bias = nn.Parameter(torch.zeros(num_heads, self.num_buckets))
+
+    def forward(self, seq_len, device):
+        pos = torch.arange(seq_len, device=device)
+
+        # (seq_len, seq_len)
+        rel_pos = pos[None, :] - pos[:, None]
+
+        rel_pos += self.max_seq_len - 1
+        rel_pos = rel_pos.clamp(0, self.num_buckets - 1)
+        bias = self.bias[:, rel_pos]
+        # (1, h, seq_len, seq_len)
+        return bias.unsqueeze(0)
+    

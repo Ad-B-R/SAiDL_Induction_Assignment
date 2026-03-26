@@ -41,7 +41,9 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class SlidingWindowAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float, pos_encoding_fn, use_rope: bool = False, **kwargs):
+    def __init__(self, d_model: int, h:int, dropout:float, 
+                 pos_encoding_fn=None, use_rope: bool = False, 
+                 rpe_fn = None, use_rpe: bool = False, **kwargs):        
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -60,14 +62,23 @@ class SlidingWindowAttention(nn.Module):
         self.use_rope = use_rope
         self.pos_encoding_fn = pos_encoding_fn
 
+        # In case rpe is used
+        self.use_rpe = use_rpe
+        self.rpe_fn = rpe_fn
+
     @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
+    def attention(query, key, value, mask, dropout: nn.Dropout, rpe_bias = None):
         d_k = query.shape[-1]
-        # (batch, seq_len, d_k) -> (batch, seq_len, seq_len)
+
+        # (batch, h, seq_len, d_k) -> (batch, h, seq_len, seq_len)
         attention_scores = ((query @ key.transpose(-2,-1))/math.sqrt(d_k))
+        if rpe_bias is not None:
+            attention_scores = attention_scores + rpe_bias
+
         if mask is not None:
             attention_scores.masked_fill_(mask == 0, float('-inf'))
         attention_scores = attention_scores.softmax(dim=-1) # batch, h, seq_len, seq_len
+
         if dropout is not None:
             attention_scores = dropout(attention_scores)
         
@@ -85,12 +96,16 @@ class SlidingWindowAttention(nn.Module):
         # key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).permute([0,2,1,3])
         value = value.view(value.shape[0], -1, self.h, self.d_k).transpose(1,2)
 
+        rpe_bias = None        
         if self.use_rope:
-            # print("Successfully reached this fn")
+            # print("Successfully reached this fn")   
             query, key = self.pos_encoding_fn(query, key)
+        elif self.use_rpe:
+            seq_len = query.shape[-2]
+            rpe_bias = self.rpe_fn(seq_len, query.device)
 
         # (batch, h, seq_len, d_k) 
-        x, self.attention_scores = SlidingWindowAttention.attention(query, key, value, mask, self.dropout)
+        x, self.attention_scores = SlidingWindowAttention.attention(query, key, value, mask, self.dropout, rpe_bias=rpe_bias)
 
         x = x.transpose(1,2)
         x = x.contiguous().view(x.shape[0], -1, self.h*self.d_k)
