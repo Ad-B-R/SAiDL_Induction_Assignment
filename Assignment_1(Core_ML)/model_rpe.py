@@ -83,8 +83,8 @@ class DecoderOnlyTransformer(nn.Module):
         self.embedding = InputEmbedding(cfg.d_model, cfg.vocab_size)
         
         # Set to none if they dont exist
-        w = cfg.attention.get("window_size", None)
-        h_GQA = cfg.attention.get("h_GQA", None)
+        w = None
+        h_GQA = None
 
         attention_type = cfg.attention.get("type", "Standard")
         rpe_pe = rpe.RelativePositionBias
@@ -92,12 +92,14 @@ class DecoderOnlyTransformer(nn.Module):
         if attention_type=="GQA":
             attention_math = GQA.GroupedQueryAttention
             attention_body = GQA.StandardAttention
+            h_GQA = getattr(cfg.attention, "h_GQA", 2)
 
             print(f"GQA no of Group heads: {h_GQA}")
 
         elif attention_type=="Sliding": 
             attention_math = Sliding_Window.SlidingWindowAttention
             attention_body = Sliding_Window.StandardAttention
+            w = getattr(cfg.attention, "window_size", 64)
 
             print(f"Window Size: {w}")
         elif attention_type=="SoftmaxFree":
@@ -110,11 +112,12 @@ class DecoderOnlyTransformer(nn.Module):
             attention_body = baseline.StandardAttention
 
             print("Standard Attention being used")
+        rpe_fn = rpe_pe(cfg.h, cfg.seq_len)
         layers = nn.ModuleList([
             AttentionBlock(
                 features=cfg.d_model,
                 self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, h_GQA = h_GQA, 
-                                                    rpe_fn=rpe_pe(cfg.h, cfg.seq_len), use_rpe=True),
+                                                    rpe_fn=rpe_fn, use_rpe=True),
                 feed_forward_block=FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout),
                 dropout=cfg.dropout
             ) for _ in range(cfg.num_layers)
@@ -165,11 +168,7 @@ def train(cfg: DictConfig):
     base_seq_len = cfg.seq_len
     base_batch_size = cfg.batch_size
 
-    
-    cfg.attention.window_size = getattr(cfg.attention, "window_size", 64)
-    cfg.attention.h_GQA = getattr(cfg.attention, "h_GQA", 2)
-    
-    attention_types = ["Standard", "GQA", "SoftmaxFree", "Sliding"]
+    attention_types = ["GQA", "SoftmaxFree", "Sliding"]
     multipliers = [1, 2, 3, 4]
     
     for attn in attention_types:
@@ -178,50 +177,53 @@ def train(cfg: DictConfig):
             cfg.seq_len = base_seq_len * mult
             cfg.batch_size = max(1, base_batch_size // mult) 
             
-            print(f"\nSTARTING RUN: {attn} Attention | Seq Len {cfg.seq_len} | Batch {cfg.batch_size}\n")
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
 
             wandb.init(
                 project="transformer-master-ablation", 
-                name=f"{attn}_seq_{cfg.seq_len}_RPE_Bias",         
+                name=f"{attn}_seq_{cfg.seq_len}_RPE", 
                 config=OmegaConf.to_container(cfg, resolve=True),
                 reinit=True 
             )
             
             train_loader = create_dataloader(cfg, split="train", shuffle=True)
             val_loader = create_dataloader(cfg, split="validation", shuffle=False)
-            
             model = DecoderOnlyTransformer(cfg).to(device)
-            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=5e-5)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
             loss_fn = nn.CrossEntropyLoss()
-            
             scaler = torch.amp.GradScaler("cuda")
+            
             global_step = 0
             
             for epoch in range(cfg.epochs):
+                epoch_start_time = time.time()
+                epoch_loss = torch.tensor(0.0, device=device)
+                tokens_in_epoch = 0
                 model.train()
-                start_time = time.time()
-                tokens_processed = 0
                 
+                start_time = time.time() 
+                tokens_processed = 0      
+
                 for idx, batch in enumerate(train_loader):
                     x = batch["input_ids"].to(device)
                     y = batch["labels"].to(device)
                     
                     optimizer.zero_grad()
-                    
                     with torch.autocast(device_type="cuda", dtype=torch.float16):
                         logits = model(x)
-                        logits = logits.view(-1, cfg.vocab_size)
-                        y = y.view(-1)
-                        loss = loss_fn(logits, y)
+                        loss = loss_fn(logits.view(-1, cfg.vocab_size), y.view(-1))
                     
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
                     
+                    epoch_loss += loss.detach()
+                    tokens_in_epoch += (x.shape[0] * x.shape[1])
+                    
                     tokens_processed += (x.shape[0] * x.shape[1])
                     global_step += 1
-                    
-                    if idx % 20 == 0 and idx != 0 and idx%100!=0: 
+                    if idx % 20 == 0 and idx != 0 and idx%250!=0: 
                         elapsed_time = time.time() - start_time
                         throughput = tokens_processed / elapsed_time
                         
@@ -236,7 +238,7 @@ def train(cfg: DictConfig):
                         start_time = time.time()
                         tokens_processed = 0
                     
-                    if idx % 100 == 0 and idx != 0:
+                    if idx % 250 == 0 and idx != 0:
                         elapsed_time = time.time() - start_time
                         throughput = tokens_processed / elapsed_time
                         
@@ -258,10 +260,27 @@ def train(cfg: DictConfig):
 
                         start_time = time.time()
                         tokens_processed = 0
-                        
-                val_loss, val_perplexity = run_validation(model, val_loader, loss_fn, cfg.vocab_size, device)
-                print(f"Epoch {epoch+1} END | Val Loss: {val_loss:.4f} | Val Perplexity: {val_perplexity:.4f}")
+
+                epoch_duration = time.time() - epoch_start_time
+                avg_train_loss = epoch_loss.item() / len(train_loader)
+                epoch_throughput = tokens_in_epoch / epoch_duration
                 
+                val_loss, val_perplexity = run_validation(model, val_loader, loss_fn, cfg.vocab_size, device)
+                
+                peak_mem_gb = torch.cuda.max_memory_allocated(device) / (1024**3)
+
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "final_train_loss": avg_train_loss,
+                    "final_val_loss": val_loss,
+                    "final_val_perplexity": val_perplexity,
+                    "peak_gpu_mem_gb": peak_mem_gb,
+                    "train_time_epoch_sec": epoch_duration,
+                    "avg_throughput_tkn_s": epoch_throughput
+                }, step=global_step)
+
+                print(f"DONE {attn} L{cfg.seq_len} | Loss: {val_loss:.4f} | Mem: {peak_mem_gb:.2f}GB | Speed: {epoch_throughput:.0f} tkn/s")
+            
             wandb.finish()
 
 if __name__ == "__main__":
