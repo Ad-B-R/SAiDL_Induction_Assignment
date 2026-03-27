@@ -42,7 +42,8 @@ class StandardAttention(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model: int, h:int, dropout:float, 
                  pos_encoding_fn=None, use_rope: bool = False, 
-                 rpe_fn = None, use_rpe: bool = False, **kwargs):
+                 rpe_fn = None, use_rpe: bool = False, 
+                 alibi_fn = None, use_alibi: bool = False, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.h = h
@@ -65,14 +66,20 @@ class MultiHeadAttention(nn.Module):
         self.use_rpe = use_rpe
         self.rpe_fn = rpe_fn
 
+        # In case alibi is used
+        self.use_alibi = use_alibi
+        self.alibi_fn = alibi_fn
+
     @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout, rpe_bias = None):
+    def attention(query, key, value, mask, dropout: nn.Dropout, rpe_bias = None, alibi_pos=None):
         d_k = query.shape[-1]
 
         # (batch, seq_len, d_k) -> (batch, h, seq_len, seq_len)
         attention_scores = ((query @ key.transpose(-2,-1))/math.sqrt(d_k))
         if rpe_bias is not None:
             attention_scores = attention_scores + rpe_bias
+        if alibi_pos is not None:
+            attention_scores = attention_scores + alibi_pos
 
         if mask is not None:
             attention_scores.masked_fill_(mask == 0, float('-inf'))
@@ -96,15 +103,20 @@ class MultiHeadAttention(nn.Module):
         value = value.view(value.shape[0], -1, self.h, self.d_k).transpose(1,2)
 
         rpe_bias = None        
+        alibi_pos = None
         if self.use_rope:
             # print("Successfully reached this fn")   
             query, key = self.pos_encoding_fn(query, key)
         elif self.use_rpe:
             seq_len = query.shape[-2]
             rpe_bias = self.rpe_fn(seq_len, query.device)
+        elif self.use_alibi:
+            seq_len = query.shape[-2]
+            alibi_pos = self.alibi_fn(seq_len, query.device)
 
         # (batch, h, seq_len, d_k) 
-        x, self.attention_scores = MultiHeadAttention.attention(query, key, value, mask, self.dropout, rpe_bias=rpe_bias)
+        x, self.attention_scores = MultiHeadAttention.attention(query, key, value, mask, self.dropout, 
+                                                                rpe_bias=rpe_bias, alibi_pos=alibi_pos)
 
         x = x.transpose(1,2)
         x = x.contiguous().view(x.shape[0], -1, self.h*self.d_k)

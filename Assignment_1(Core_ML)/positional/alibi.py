@@ -1,25 +1,27 @@
 import torch
 import torch.nn as nn
-import math
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, seq_len: int, dropout: float):
+import torch
+import torch.nn as nn
+
+class AlibiPosition(nn.Module):
+    def __init__(self, num_heads):
         super().__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(self.seq_len, d_model)
-        position = torch.arange(0, self.seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float()* 
-                            (-math.log(10000)/self.d_model))
-        pe[:,0::2] = torch.sin(position*div_term)
-        pe[:,1::2] = torch.cos(position*div_term)
-        pe = pe.unsqueeze(0)
+        self.num_heads = num_heads
+        m_1 = 2**(-8/self.num_heads)
+        slope = torch.pow(m_1, torch.arange(1, self.num_heads+1))
 
-        self.register_buffer('pe', pe)
+        slope = slope.view(self.num_heads, 1, 1)
 
-    @torch.no_grad()
-    def forward(self, x):
-        x = x + self.pe[:, :x.shape[1], :] # for different broadcasting purposes
-        return self.dropout(x)
+        self.register_buffer("slope", slope, persistent=False)
+
+def forward(self, seq_len, device):
+    pos = torch.arange(seq_len, device=device)
+    # (seq_len, seq_len)
+    distance_matrix = torch.abs(pos[None, :] - pos[:, None])  
+    # (1, seq_len, seq_len) -> (h, seq_len, seq_len)
+    alibi_pos = -self.slope.view(-1, 1, 1) * distance_matrix   
+    # (1, h, seq_len, seq_len)
+    return alibi_pos.unsqueeze(0)                               
+    
