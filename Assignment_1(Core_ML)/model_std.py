@@ -170,9 +170,7 @@ def train(cfg: DictConfig):
     cfg.attention.window_size = getattr(cfg.attention, "window_size", 64)
     cfg.attention.h_GQA = getattr(cfg.attention, "h_GQA", 2)
     
-    attention_types = [
-        # "Standard", "GQA","Sliding",
-                       "SoftmaxFree"]
+    attention_types = ["Standard", "GQA","Sliding","SoftmaxFree"]
     multipliers = [1, 2, 3, 4]
     
     for attn in attention_types:

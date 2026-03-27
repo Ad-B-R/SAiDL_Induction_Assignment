@@ -16,12 +16,12 @@ class AlibiPosition(nn.Module):
 
         self.register_buffer("slope", slope, persistent=False)
 
-def forward(self, seq_len, device):
-    pos = torch.arange(seq_len, device=device)
-    # (seq_len, seq_len)
-    distance_matrix = torch.abs(pos[None, :] - pos[:, None])  
-    # (1, seq_len, seq_len) -> (h, seq_len, seq_len)
-    alibi_pos = -self.slope.view(-1, 1, 1) * distance_matrix   
-    # (1, h, seq_len, seq_len)
-    return alibi_pos.unsqueeze(0)                               
+    def forward(self, seq_len, device):
+        pos = torch.arange(seq_len, device=device)
+        # (seq_len, seq_len)
+        distance_matrix = torch.abs(pos[None, :] - pos[:, None])  
+        # (1, seq_len, seq_len) -> (h, seq_len, seq_len)
+        alibi_pos = -self.slope.view(-1, 1, 1) * distance_matrix   
+        # (1, h, seq_len, seq_len)
+        return alibi_pos.unsqueeze(0)                               
     
