@@ -24,4 +24,3 @@ class AlibiPosition(nn.Module):
         alibi_pos = -self.slope.view(-1, 1, 1) * distance_matrix   
         # (1, h, seq_len, seq_len)
         return alibi_pos.unsqueeze(0)                               
-    

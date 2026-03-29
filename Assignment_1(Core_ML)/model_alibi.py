@@ -167,8 +167,9 @@ def train(cfg: DictConfig):
     base_seq_len = cfg.seq_len
     base_batch_size = cfg.batch_size
 
-    attention_types = ["GQA", "SoftmaxFree", "Sliding"]
+    attention_types = ["Standard","GQA", "SoftmaxFree", "Sliding"]
     multipliers = [1, 2, 3, 4]
+    multipliers = [2]
     
     for attn in attention_types:
         for mult in multipliers:
@@ -279,7 +280,32 @@ def train(cfg: DictConfig):
                 }, step=global_step)
 
                 print(f"DONE {attn} L{cfg.seq_len} | Loss: {val_loss:.4f} | Mem: {peak_mem_gb:.2f}GB | Speed: {epoch_throughput:.0f} tkn/s")
-            
+
+            if cfg.seq_len == 512:
+                extrap_lengths = [512, 1024, 2048]
+                
+                for ext_len in extrap_lengths:
+                    print(f"Testing Extrapolation on L={ext_len}...")
+                    
+                    cfg.seq_len = ext_len
+                    cfg.batch_size = max(1, base_batch_size // (ext_len // 256)) 
+                    
+                    extrap_loader = create_dataloader(cfg, split="validation", shuffle=False)
+                    
+                    try:
+                        extrap_loss, extrap_perp = run_validation(model, extrap_loader, loss_fn, cfg.vocab_size, device)
+                        
+                        wandb.log({
+                            f"extrap_val_perplexity_L{ext_len}": extrap_perp
+                        })
+                        print(f"Extrap L={ext_len} | Perplexity: {extrap_perp:.2f}")
+                        
+                    except Exception as e:
+                        print(f"Extrap L={ext_len} FAILED: {e}")
+                        wandb.log({f"extrap_val_perplexity_L{ext_len}": float('inf')})
+                
+                    cfg.seq_len = 512
+
             wandb.finish()
 
 if __name__ == "__main__":
