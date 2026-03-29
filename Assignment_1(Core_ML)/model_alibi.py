@@ -168,7 +168,6 @@ def train(cfg: DictConfig):
     base_batch_size = cfg.batch_size
 
     attention_types = ["Standard","GQA", "SoftmaxFree", "Sliding"]
-    multipliers = [1, 2, 3, 4]
     multipliers = [2]
     
     for attn in attention_types:
