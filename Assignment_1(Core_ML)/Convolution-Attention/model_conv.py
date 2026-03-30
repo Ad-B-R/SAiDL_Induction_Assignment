@@ -8,6 +8,8 @@ import math
 from data_conv import create_dataloader
 import time
 import conformer
+import os
+import conv
 
 @torch.no_grad()
 def run_validation(model, dataloader, loss_fn, vocab_size, device, eval_iters=None):
@@ -35,25 +37,6 @@ def run_validation(model, dataloader, loss_fn, vocab_size, device, eval_iters=No
     perplexity = math.exp(avg_loss) if avg_loss < 20 else float('inf')
     return avg_loss, perplexity
     
-class AttentionBlock(nn.Module):
-    def __init__(self, features, self_attention_block: nn.Module, feed_forward_block: conformer.FeedForwardNetwork,
-                 dropout: float):
-        super().__init__()
-        self.self_attention_block = self_attention_block
-        self.feed_foward_network = feed_forward_block
-        self.conv_block = conformer.NGramConvBlock(d_model=features)
-        self.dropout = dropout
-        self.residual_connections = nn.ModuleList([conformer.ResidualConnections(features, dropout) for _ in range(3)])
-
-    def forward(self, x, src_mask):
-        # Residual_connections stores residual blocks, 
-        # hence following means ResidualConnections.forward(x, sublayer)
-        x = self.residual_connections[0](x, 
-            lambda x: self.self_attention_block(x,src_mask))
-        # residual_connections__Call__() expects only one input function, hence we do this
-        x = self.residual_connections[1](x, self.conv_block)
-        x = self.residual_connections[2](x, self.feed_foward_network)
-        return x
     
 class Conformer(nn.Module):
     def __init__(self, cfg):
@@ -64,27 +47,46 @@ class Conformer(nn.Module):
 
         self.embedding = conformer.InputEmbedding(cfg.d_model, cfg.vocab_size)
         
-        w = 2
         attention_math = conformer.SlidingWindowAttention
         attention_body = conformer.StandardAttentionMask
         w = getattr(cfg.attention, "window_size", 64)
 
         alibi_pe = conformer.AlibiPosition
-        layers = nn.ModuleList([
-            AttentionBlock(
-                features=cfg.d_model,
-                self_attention_block=attention_math(cfg.d_model, cfg.h, cfg.dropout, 
-                                                    alibi_fn=alibi_pe(cfg.h)),
-                feed_forward_block=conformer.FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout),
-                dropout=cfg.dropout
-            ) for _ in range(cfg.num_layers)
-        ])
+        layers = []
+        num_layers = cfg.num_layers
+        
+        for i in range(num_layers):
+            ffn = conformer.FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout)
+            
+            if cfg.attention_type == "subset":
+                if i < num_layers // 2:
+                    layers.append(conv.ConvOnlyBlock(cfg.d_model, ffn, cfg.dropout))
+                else:
+                    attn_instance = attention_math(cfg.d_model, cfg.h, cfg.dropout, alibi_fn=alibi_pe(cfg.h))
+                    layers.append(conformer.ConvAttentionBlock(cfg.d_model, attn_instance, ffn, cfg.dropout))
+                    
+            elif cfg.attention_type == "interleaved":
+                if i % 2 == 0:
+                    layers.append(conv.ConvOnlyBlock(cfg.d_model, ffn, cfg.dropout))
+                else:
+                    attn_instance = attention_math(cfg.d_model, cfg.h, cfg.dropout, alibi_fn=alibi_pe(cfg.h))
+                    layers.append(conformer.ConvAttentionBlock(cfg.d_model, attn_instance, ffn, cfg.dropout))
+
         self.transformer = attention_body(cfg.d_model, layers, window=w)
         
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
+    def forward(self, x):
+        x = self.embedding(x)
+        
+        x = self.transformer(x, mask=None) 
+        
+        # Output shape: (batch_size, seq_len, vocab_size)
+        return self.lm_head(x)
 
-@hydra.main(version_base=None, config_name="config")
+config_dir = os.path.dirname(os.path.abspath(__file__))
+
+@hydra.main(version_base=None, config_path=config_dir, config_name="config")
 def train(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False) 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -92,12 +94,11 @@ def train(cfg: DictConfig):
     base_seq_len = cfg.seq_len
     base_batch_size = cfg.batch_size
 
-    attention_types = ["Standard","GQA", "SoftmaxFree", "Sliding"]
-    multipliers = [1,2,3,4]
+    attention_types = ["interleaved","subset"]
     multipliers = [2]
     for attn in attention_types:
         for mult in multipliers:
-            cfg.attention.type = attn
+            cfg.attention = attn
             cfg.seq_len = base_seq_len * mult
             cfg.batch_size = max(1, base_batch_size // mult) 
             
@@ -205,3 +206,5 @@ def train(cfg: DictConfig):
 
                 print(f"DONE {attn} L{cfg.seq_len} | Loss: {val_loss:.4f} | Mem: {peak_mem_gb:.2f}GB | Speed: {epoch_throughput:.0f} tkn/s")
             wandb.finish()
+if __name__=="__main__":
+    train()

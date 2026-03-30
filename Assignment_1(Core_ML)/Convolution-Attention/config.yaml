@@ -1,8 +1,4 @@
-defaults:
-  - attention: SoftmaxFree    
-  - positional: Standard   
-  - _self_                 
-
+attention_type: "Interleaved_Convolution"
 dataset: "wikitext-2"
 seq_len: 256
 batch_size: 4

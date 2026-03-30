@@ -6,7 +6,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
-from data import create_dataloader
+from data_conv import create_dataloader
 
 
 # Run for different context lengths
@@ -96,26 +96,7 @@ class NGramConvBlock(nn.Module):
         out = conv_out.transpose(1, 2)
         
         return self.activation(out) 
-    
-class AttentionBlock(nn.Module):
-    def __init__(self, features, self_attention_block: nn.Module, feed_forward_block: FeedForwardNetwork,
-                 dropout: float):
-        super().__init__()
-        self.self_attention_block = self_attention_block
-        self.feed_foward_network = feed_forward_block
-        self.conv_block = NGramConvBlock(d_model=features)
-        self.dropout = dropout
-        self.residual_connections = nn.ModuleList([ResidualConnections(features, dropout) for _ in range(3)])
 
-    def forward(self, x, src_mask):
-        # Residual_connections stores residual blocks, 
-        # hence following means ResidualConnections.forward(x, sublayer)
-        x = self.residual_connections[0](x, 
-            lambda x: self.self_attention_block(x,src_mask))
-        # residual_connections__Call__() expects only one input function, hence we do this
-        x = self.residual_connections[1](x, self.conv_block)
-        x = self.residual_connections[2](x, self.feed_foward_network)
-        return x
 
 class StandardAttentionMask(nn.Module):
     def __init__(self, features, layers: nn.ModuleList, window=64, **kwargs):
@@ -205,3 +186,22 @@ class SlidingWindowAttention(nn.Module):
 
         return self.Wo(x)
 
+class ConvAttentionBlock(nn.Module):
+    def __init__(self, features, self_attention_block: nn.Module, feed_forward_block: FeedForwardNetwork,
+                 dropout: float):
+        super().__init__()
+        self.self_attention_block = self_attention_block
+        self.feed_foward_network = feed_forward_block
+        self.conv_block = NGramConvBlock(d_model=features)
+        self.dropout = dropout
+        self.residual_connections = nn.ModuleList([ResidualConnections(features, dropout) for _ in range(3)])
+
+    def forward(self, x, src_mask):
+        # Residual_connections stores residual blocks, 
+        # hence following means ResidualConnections.forward(x, sublayer)
+        x = self.residual_connections[0](x, 
+            lambda x: self.self_attention_block(x,src_mask))
+        # residual_connections__Call__() expects only one input function, hence we do this
+        x = self.residual_connections[1](x, self.conv_block)
+        x = self.residual_connections[2](x, self.feed_foward_network)
+        return x
