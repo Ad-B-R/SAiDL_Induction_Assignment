@@ -33,7 +33,7 @@ def get_activation_batches(dataset, batch_size=1024, seq_len=128):
                 yield torch.cat(batch_texts, dim=0)
                 batch_texts = []
 
-dataset_loader = get_activation_batches(dataset, batch_size=32)
+dataset_loader = get_activation_batches(dataset, batch_size=64)
 activations_cache = {} 
 
 class TopKSAE(nn.Module):
@@ -62,8 +62,8 @@ def hook_fn(module, input, output):
 hook_handle = model.transformer.h[2].register_forward_hook(hook_fn)
 
 # model(dummy_input)
-m_bottleneck = 512
-os.makedirs("./sae_checkpoints", exist_ok=True)
+m_bottleneck = 512*2
+os.makedirs("./sae_checkpoints_64", exist_ok=True)
 
 sae_model = TopKSAE(input_dim=768, hidden_dim=m_bottleneck).to(device)
 sae_optimizer = optim.Adam(sae_model.parameters(), lr=1e-4)
@@ -110,7 +110,7 @@ for step, batch_loaded in enumerate(dataset_loader):
     #     break
 
     if step > 0 and step % 5000 == 0:
-        ckpt_path = f"./sae_checkpoints/sae_m{m_bottleneck}_step{step}.pt"
+        ckpt_path = f"./sae_checkpoints_64/sae_m{m_bottleneck}_step{step}_64.pt"
         torch.save(sae_model.state_dict(), ckpt_path)
         tqdm.write(f"--> Checkpoint saved: {ckpt_path}")
 
