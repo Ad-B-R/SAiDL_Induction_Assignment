@@ -45,7 +45,7 @@ sae_model.eval()
 
 
 dataset = load_dataset("openwebtext", split="train", streaming=True)
-skip_dataset = dataset.skip(2_000_000) # skip 2 million data so that there is no collision between training and testing data
+skip_dataset = dataset.skip(400_000) # skip 400k data so that there is no collision between training and testing data
 
 def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
     batch_texts = []
@@ -70,7 +70,7 @@ def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
                     return # Stop the generator once we hit our eval limit
 
 def quantize_gen(min, max, bit, tensor):
-    q_max = 2**bit - 1
+    q_max = int(2**bit - 1)
     s = (max-min)/(q_max + 1e-9)
     shift = tensor - min
     q = torch.round(shift/(s + 1e-9))
@@ -112,9 +112,19 @@ feature_min, feature_max = None, None
 with torch.no_grad():
     for batch in calib_batches:
 
-        acts = model.transformer.h[2](model.transformer.h[1](model.transformer.wte(batch))[0])[0]
-        _, sparse_feats = sae_model(acts)
+        seq_len = batch.size(1)
+        pos = torch.arange(seq_len, device=device).unsqueeze(0)
         
+        # Start with Embeddings
+        x = model.transformer.wte(batch) + model.transformer.wpe(pos)
+        x = model.transformer.drop(x)
+        
+        # Run up to the input of Layer 3 (Index 2)
+        for i in range(2):
+            x = model.transformer.h[i](x)[0]
+        
+        acts = x # This is now the actual input Layer 3 expects
+        _, sparse_feats = sae_model(acts) 
         batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
         batch_max = sparse_feats.amax(dim=(0,1))
 
@@ -137,12 +147,15 @@ def get_intervention_hook(bits, mode = "per_tensor"):
         
         if bits is not None:
             if mode=="per_tensor":    
-                damaged_feats = quantize_gen(tensor=sparse_feats, bit=bits, min=global_min, max=global_max)
+                damaged_feats = quantize_gen(min=global_min, 
+                                             max=global_max, 
+                                             bit=bits,
+                                             tensor=sparse_feats) 
             elif mode == "per_feature":
                 damaged_feats = quantize_gen(
-                    sparse_feats, bits,
-                    feature_min.unsqueeze(0).unsqueeze(0),
-                    feature_max.unsqueeze(0).unsqueeze(0)
+                    min = feature_min.unsqueeze(0).unsqueeze(0),
+                    max = feature_max.unsqueeze(0).unsqueeze(0),
+                    bit=bits, tensor=sparse_feats
                 )
             reconstructed = sae_model.decoder(damaged_feats)
         else:
@@ -170,6 +183,7 @@ for mode in modes:
         )                
         wandb.init(
             project="sae-quantization",
+            name = f"{mode}_{bits}_32_batch",
             config={
                 "model": "distilgpt2",
                 "layer": 3,
@@ -195,16 +209,17 @@ for mode in modes:
                 _, sparse_feats = sae_model(clean_acts)
                 Z_batch = sparse_feats.clone()
                 if bits is not None:
-                    if mode == "per_tensor":
-                        Z_hat_batch = quantize_gen(
-                            sparse_feats, bits, global_min, global_max
-                        )
-                    else:
-                        Z_hat_batch = quantize_gen(
-                            sparse_feats, bits,
-                            feature_min.unsqueeze(0).unsqueeze(0),
-                            feature_max.unsqueeze(0).unsqueeze(0)
-                        )
+                    if mode=="per_tensor":    
+                        damaged_feats = quantize_gen(min=global_min, 
+                                             max=global_max, 
+                                             bit=bits,
+                                             tensor=sparse_feats) 
+                    elif mode == "per_feature":
+                        damaged_feats = quantize_gen(
+                        min = feature_min.unsqueeze(0).unsqueeze(0),
+                        max = feature_max.unsqueeze(0).unsqueeze(0),
+                        bit=bits, tensor=sparse_feats
+                )
                 else:
                     Z_hat_batch = Z_batch
                 Z = Z_batch.view(-1, Z_batch.size(-1))
@@ -249,7 +264,7 @@ with torch.no_grad():
     
     for bits in [8, 4, 2]:
         # Applying per_tensor quantization damage
-        damaged = quantize_gen(feats, bits, global_min, global_max)
+        damaged = quantize_gen(tensor=feats, bit=bits, min=global_min, max=global_max)
         recon = sae_model.decoder(damaged)
         viz_data[f"{bits}-bit"] = recon.cpu().numpy()
 
