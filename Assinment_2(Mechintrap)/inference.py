@@ -7,6 +7,9 @@ from tqdm.auto import tqdm
 import os
 import math
 import wandb
+import matplotlib.pyplot as plt
+import umap
+import numpy as np
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -75,10 +78,37 @@ def quantize_gen(min, max, bit, tensor):
     de_quantize = (q_clip*s) + min
     return de_quantize
 
+def SDS(Z, Z_hat, k):
+    Z_c = Z - Z.mean(dim=0, keepdim=True)
+    U, S, Vh = torch.linalg.svd(Z_c, full_matrices=False)
+    Uk = Vh[:k].T   # [D, k]
+
+    E = Z - Z_hat
+
+    num = torch.norm(E @ Uk)**2
+    den = torch.norm(Z @ Uk)**2
+
+    return (num/den).item()
+
+def CKA(X, Y):
+    X = X - X.mean(dim=0, keepdim=True)
+    Y = Y - Y.mean(dim=0, keepdim=True)
+    
+    dot_product_similarity = torch.norm(X.t() @ Y)**2
+    
+    normalization_x = torch.norm(X.t() @ X)
+    normalization_y = torch.norm(Y.t() @ Y)
+    
+    cka_score = dot_product_similarity / (normalization_x * normalization_y + 1e-9)
+    return cka_score.item()
+
 print("\nCalibrating Min/Max ranges on held-out data...")
-calib_batches = list(get_eval_batches(skip_dataset, num_batches=10))
+
+calib_batches = list(get_eval_batches(skip_dataset, num_batches=1))
 global_min, global_max = float('inf'), float('-inf')
 feature_min, feature_max = None, None
+
+
 with torch.no_grad():
     for batch in calib_batches:
 
@@ -121,8 +151,8 @@ def get_intervention_hook(bits, mode = "per_tensor"):
         return (reconstructed,) + output[1:]
     return hook
 
-bit_configs = [None, 8, 4, 2] # None = Baseline, 8/4/2 = Quantization Damage
-eval_batches = list(get_eval_batches(skip_dataset, num_batches=50)) # Evaluate on ~200k tokens
+bit_configs = [None, 8, 4, 2]
+eval_batches = list(get_eval_batches(skip_dataset, num_batches=5))
 modes = ["per_tensor", "per_feature"]
 
 for mode in modes:
@@ -152,45 +182,91 @@ for mode in modes:
             },
             reinit=True
         )
-        total_loss, total_mse = 0, 0
+        total_loss, total_mse, total_sds, total_cka = 0, 0, 0, 0
 
         with torch.no_grad():
             idx = 0
             for batch in tqdm(eval_batches, leave=False):
                 outputs = model(batch, labels=batch)
                 total_loss += outputs.loss.item()
+                clean_acts = model.transformer.h[2](
+                    model.transformer.h[1](model.transformer.wte(batch))[0])[0]
+
+                _, sparse_feats = sae_model(clean_acts)
+                Z_batch = sparse_feats.clone()
                 if bits is not None:
-                    clean_acts = model.transformer.h[2](
-                        model.transformer.h[1](model.transformer.wte(batch))[0])[0]
+                    if mode == "per_tensor":
+                        Z_hat_batch = quantize_gen(
+                            sparse_feats, bits, global_min, global_max
+                        )
+                    else:
+                        Z_hat_batch = quantize_gen(
+                            sparse_feats, bits,
+                            feature_min.unsqueeze(0).unsqueeze(0),
+                            feature_max.unsqueeze(0).unsqueeze(0)
+                        )
+                else:
+                    Z_hat_batch = Z_batch
+                Z = Z_batch.view(-1, Z_batch.size(-1))
+                Z_hat = Z_hat_batch.view(-1, Z_batch.size(-1))
 
-                    _, sparse_feats = sae_model(clean_acts)
+                recon_acts = sae_model.decoder(Z_hat_batch)
+                
+                total_mse += nn.MSELoss()(recon_acts, clean_acts).item()
+                total_sds += SDS(Z=Z, Z_hat=Z_hat, k=32)
+                total_cka += CKA(X=recon_acts.view(-1, 768), Y = clean_acts.view(-1, 768))
 
-                    if bits > 0:
-                        if mode == "per_tensor":
-                            sparse_feats = quantize_gen(
-                                sparse_feats, bits, global_min, global_max
-                            )
-                        else:
-                            sparse_feats = quantize_gen(
-                                sparse_feats, bits,
-                                feature_min.unsqueeze(0).unsqueeze(0),
-                                feature_max.unsqueeze(0).unsqueeze(0)
-                            )
-
-                    recon_acts = sae_model.decoder(sparse_feats)
-                    total_mse += nn.MSELoss()(recon_acts, clean_acts).item()
-                if idx%50==0:
+                if idx%500==0:
                     wandb.log({
                     "perplexity": math.exp(total_loss/(idx+1)),
-                    "mse": total_mse / (idx+1) if bits is not None else 0
+                    "mse": total_mse / (idx+1) if bits is not None else 0,
+                    "cka": total_cka / (idx+1) if bits is not None else 0,
+                    "sds": total_sds / (idx+1) if bits is not None else 0
                     })
                 idx+=1
-
         avg_loss = total_loss / len(eval_batches)
         print(f"Perplexity: {math.exp(avg_loss):.2f}")
 
-        if bits is not None:
+        if bits is not None:    
             print(f"MSE: {total_mse / len(eval_batches):.4f}")
 
         if handle:
             handle.remove()
+
+print("\nGathering 10,000 tokens for UMAP visualization...")
+all_clean = []
+
+with torch.no_grad():
+    for batch in eval_batches:
+        clean = model.transformer.h[2](model.transformer.h[1](model.transformer.wte(batch))[0])[0]
+        all_clean.append(clean.view(-1, 768))
+
+X_clean = torch.cat(all_clean, dim=0)[:10000]
+viz_data = {"Baseline": X_clean.cpu().numpy()}
+
+with torch.no_grad():
+    _, feats = sae_model(X_clean)
+    
+    for bits in [8, 4, 2]:
+        # Applying per_tensor quantization damage
+        damaged = quantize_gen(feats, bits, global_min, global_max)
+        recon = sae_model.decoder(damaged)
+        viz_data[f"{bits}-bit"] = recon.cpu().numpy()
+
+print("Running UMAP Projection (This will take ~60 seconds)...")
+fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+fig.suptitle("UMAP Projection of SAE Quantization Damage", fontsize=16)
+
+reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
+baseline_2d = reducer.fit_transform(viz_data["Baseline"])
+
+for idx, (label, data) in enumerate(viz_data.items()):
+    proj = baseline_2d if label == "Baseline" else reducer.transform(data)
+    
+    axes[idx].scatter(proj[:, 0], proj[:, 1], s=1, alpha=0.5)
+    axes[idx].set_title(label)
+    axes[idx].axis('off')
+
+plt.tight_layout()
+plt.savefig("quantization_grid_collapse.png", dpi=300)
+print("\nSaved visualization to 'quantization_grid_collapse.png'")
