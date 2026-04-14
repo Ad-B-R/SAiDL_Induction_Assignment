@@ -10,13 +10,13 @@ import wandb
 import matplotlib.pyplot as plt
 import umap
 import numpy as np
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
 model = AutoModelForCausalLM.from_pretrained("distilgpt2").to(device)
 model.eval()
 
+m_bottleneck = 512
 
 class TopKSAE(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
@@ -33,7 +33,6 @@ class TopKSAE(nn.Module):
         reconstructed = self.decoder(sparse_encoded)
         return reconstructed, sparse_encoded
 
-m_bottleneck = 512 
 sae_model = TopKSAE(hidden_dim=m_bottleneck).to(device)
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 weights_folder = os.path.join(current_script_dir, "weights")
@@ -45,7 +44,7 @@ sae_model.eval()
 
 
 dataset = load_dataset("openwebtext", split="train", streaming=True)
-skip_dataset = dataset.skip(400_000) # skip 400k data so that there is no collision between training and testing data
+skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
 
 def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
     batch_texts = []
@@ -164,9 +163,28 @@ def get_intervention_hook(bits, mode = "per_tensor"):
         return (reconstructed,) + output[1:]
     return hook
 
-bit_configs = [None, 8, 4, 2]
+bit_configs = [None, 8, 6, 4, 2]
 eval_batches = list(get_eval_batches(skip_dataset, num_batches=5))
 modes = ["per_tensor", "per_feature"]
+
+umap_data = {
+    "Baseline": [],
+    'per_tensor': {
+    "8-bit_per_tensor": [],
+    "6-bit_per_tensor": [],
+    "4-bit_per_tensor": [],
+    "2-bit_per_tensor": []
+    },
+    'per_feature': {
+    "8-bit_per_feature": [],
+    "6-bit_per_feature": [],
+    "4-bit_per_feature": [],
+    "2-bit_per_feature": []
+    }
+}
+
+def normalize(x):
+    return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-9)
 
 for mode in modes:
     print(f"\nMode: {mode}")
@@ -183,7 +201,7 @@ for mode in modes:
         )                
         wandb.init(
             project="sae-quantization",
-            name = f"{mode}_{bits}_32_batch",
+            name = f"{mode}_{bits}_32_batch_{m_bottleneck}",
             config={
                 "model": "distilgpt2",
                 "layer": 3,
@@ -203,19 +221,23 @@ for mode in modes:
             for batch in tqdm(eval_batches, leave=False):
                 outputs = model(batch, labels=batch)
                 total_loss += outputs.loss.item()
-                clean_acts = model.transformer.h[2](
-                    model.transformer.h[1](model.transformer.wte(batch))[0])[0]
-
+                seq_len = batch.size(1)
+                pos = torch.arange(seq_len, device=device).unsqueeze(0)
+                x = model.transformer.wte(batch) + model.transformer.wpe(pos)
+                x = model.transformer.drop(x)
+                for i in range(2): 
+                    x = model.transformer.h[i](x)[0]
+                clean_acts = x
                 _, sparse_feats = sae_model(clean_acts)
                 Z_batch = sparse_feats.clone()
                 if bits is not None:
                     if mode=="per_tensor":    
-                        damaged_feats = quantize_gen(min=global_min, 
+                        Z_hat_batch = quantize_gen(min=global_min, 
                                              max=global_max, 
                                              bit=bits,
                                              tensor=sparse_feats) 
                     elif mode == "per_feature":
-                        damaged_feats = quantize_gen(
+                        Z_hat_batch = quantize_gen(
                         min = feature_min.unsqueeze(0).unsqueeze(0),
                         max = feature_max.unsqueeze(0).unsqueeze(0),
                         bit=bits, tensor=sparse_feats
@@ -230,6 +252,10 @@ for mode in modes:
                 total_mse += nn.MSELoss()(recon_acts, clean_acts).item()
                 total_sds += SDS(Z=Z, Z_hat=Z_hat, k=32)
                 total_cka += CKA(X=recon_acts.view(-1, 768), Y = clean_acts.view(-1, 768))
+
+                Z_hat_np = (Z_hat.detach().cpu().numpy())
+                if bits is None: umap_data["Baseline"].append(Z_hat_np)
+                else: umap_data[f"{mode}"][f"{bits}-bit_{mode}"].append(Z_hat_np)
 
                 if idx%500==0:
                     wandb.log({
@@ -248,40 +274,48 @@ for mode in modes:
         if handle:
             handle.remove()
 
-print("\nGathering 10,000 tokens for UMAP visualization...")
-all_clean = []
-
-with torch.no_grad():
-    for batch in eval_batches:
-        clean = model.transformer.h[2](model.transformer.h[1](model.transformer.wte(batch))[0])[0]
-        all_clean.append(clean.view(-1, 768))
-
-X_clean = torch.cat(all_clean, dim=0)[:10000]
-viz_data = {"Baseline": X_clean.cpu().numpy()}
-
-with torch.no_grad():
-    _, feats = sae_model(X_clean)
+wandb.finish()
+print("Running UMAP...")
+for mode in modes:
+    reducer = umap.UMAP(metric='euclidean', min_dist=0.1, random_state=67)
     
-    for bits in [8, 4, 2]:
-        # Applying per_tensor quantization damage
-        damaged = quantize_gen(tensor=feats, bit=bits, min=global_min, max=global_max)
-        recon = sae_model.decoder(damaged)
-        viz_data[f"{bits}-bit"] = recon.cpu().numpy()
+    # Grab the baseline from the TOP level of the dictionary
+    baseline = np.concatenate(umap_data["Baseline"], axis=0)
+    baseline = baseline.reshape(-1, baseline.shape[-1])[:10000]
 
-print("Running UMAP Projection (This will take ~60 seconds)...")
-fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-fig.suptitle("UMAP Projection of SAE Quantization Damage", fontsize=16)
+    # Fit the reducer ONLY to the continuous baseline
+    reducer.fit(baseline)
+    baseline_2d = reducer.transform(baseline)
 
-reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, metric='cosine', random_state=42)
-baseline_2d = reducer.fit_transform(viz_data["Baseline"])
+    # 5 subplots for [Baseline, 8, 6, 4, 2]
+    fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+    fig.suptitle(f"UMAP Grid Collapse ({mode})", fontsize=16)
 
-for idx, (label, data) in enumerate(viz_data.items()):
-    proj = baseline_2d if label == "Baseline" else reducer.transform(data)
+    # These are the titles for our subplots
+    ordered_labels = ["Baseline", "8-bit", "6-bit", "4-bit", "2-bit"]
     
-    axes[idx].scatter(proj[:, 0], proj[:, 1], s=1, alpha=0.5)
-    axes[idx].set_title(label)
-    axes[idx].axis('off')
+    for i, label in enumerate(ordered_labels):
+        # 1. Fetch the correct data list based on the label
+        if label == "Baseline":
+            data_list = umap_data["Baseline"]
+        else:
+            # Reconstruct the exact dictionary key (e.g., "8-bit_per_tensor")
+            dict_key = f"{label}_{mode}" 
+            if dict_key not in umap_data[mode]: 
+                continue # Skip if this bit configuration didn't run
+            data_list = umap_data[mode][dict_key]
+            
+        # 2. Process the data
+        data = np.concatenate(data_list, axis=0)
+        data = data.reshape(-1, data.shape[-1])[:10000]
 
-plt.tight_layout()
-plt.savefig("quantization_grid_collapse.png", dpi=300)
-print("\nSaved visualization to 'quantization_grid_collapse.png'")
+        # 3. Transform and Plot
+        proj = baseline_2d if label == "Baseline" else reducer.transform(data)
+
+        axes[i].scatter(proj[:, 0], proj[:, 1], s=1, alpha=0.5)
+        axes[i].set_title(label)
+        axes[i].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(f"umap_fixed_{mode}_{m_bottleneck}.png", dpi=300)
+    print(f"Saved: umap_fixed_{mode}.png")

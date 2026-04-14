@@ -8,3 +8,5 @@ test.py
 sae_checkpoints/
 *.pt
 *.pth
+tmp_owt_cache/
+rank.py
