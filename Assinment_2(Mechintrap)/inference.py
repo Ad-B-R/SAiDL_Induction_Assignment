@@ -16,7 +16,7 @@ tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
 model = AutoModelForCausalLM.from_pretrained("distilgpt2").to(device)
 model.eval()
 
-m_bottleneck = 512
+m_bottleneck = 512*2
 
 class TopKSAE(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
@@ -138,28 +138,33 @@ with torch.no_grad():
             feature_max = torch.maximum(feature_max, batch_max)
 
 print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
+hook_cache = {}
 
-def get_intervention_hook(bits, mode = "per_tensor"):
+def get_intervention_hook(bits, mode="per_tensor"):
     def hook(module, input, output):
-        orig_acts = output[0]
+        orig_acts = output[0] # The true, clean output of Layer 3
         _, sparse_feats = sae_model(orig_acts)
         
         if bits is not None:
-            if mode=="per_tensor":    
-                damaged_feats = quantize_gen(min=global_min, 
-                                             max=global_max, 
-                                             bit=bits,
-                                             tensor=sparse_feats) 
+            if mode == "per_tensor":    
+                damaged_feats = quantize_gen(min=global_min, max=global_max, bit=bits, tensor=sparse_feats) 
             elif mode == "per_feature":
                 damaged_feats = quantize_gen(
-                    min = feature_min.unsqueeze(0).unsqueeze(0),
-                    max = feature_max.unsqueeze(0).unsqueeze(0),
+                    min=feature_min.unsqueeze(0).unsqueeze(0),
+                    max=feature_max.unsqueeze(0).unsqueeze(0),
                     bit=bits, tensor=sparse_feats
                 )
             reconstructed = sae_model.decoder(damaged_feats)
         else:
-            reconstructed = orig_acts  # baseline
+            damaged_feats = sparse_feats  # Z_hat is just Z for Baseline
+            reconstructed = orig_acts     # Pass clean acts forward
             
+        # Smuggle the synchronized tensors out of the computational graph
+        hook_cache['clean_acts'] = orig_acts.detach()
+        hook_cache['recon_acts'] = reconstructed.detach()
+        hook_cache['Z'] = sparse_feats.detach()
+        hook_cache['Z_hat'] = damaged_feats.detach()
+        
         return (reconstructed,) + output[1:]
     return hook
 
@@ -197,7 +202,6 @@ for mode in modes:
             model.transformer.h[2].register_forward_hook(
                 get_intervention_hook(bits, mode)
             )
-            if bits is not None else None
         )                
         wandb.init(
             project="sae-quantization",
@@ -215,56 +219,55 @@ for mode in modes:
             reinit=True
         )
         total_loss, total_mse, total_sds, total_cka = 0, 0, 0, 0
-
+        Z_all = []
+        Z_hat_all = []
         with torch.no_grad():
             idx = 0
             for batch in tqdm(eval_batches, leave=False):
+                # 1. This single pass fires the hook, computes PPL, and populates the cache
                 outputs = model(batch, labels=batch)
                 total_loss += outputs.loss.item()
-                seq_len = batch.size(1)
-                pos = torch.arange(seq_len, device=device).unsqueeze(0)
-                x = model.transformer.wte(batch) + model.transformer.wpe(pos)
-                x = model.transformer.drop(x)
-                for i in range(2): 
-                    x = model.transformer.h[i](x)[0]
-                clean_acts = x
-                _, sparse_feats = sae_model(clean_acts)
-                Z_batch = sparse_feats.clone()
-                if bits is not None:
-                    if mode=="per_tensor":    
-                        Z_hat_batch = quantize_gen(min=global_min, 
-                                             max=global_max, 
-                                             bit=bits,
-                                             tensor=sparse_feats) 
-                    elif mode == "per_feature":
-                        Z_hat_batch = quantize_gen(
-                        min = feature_min.unsqueeze(0).unsqueeze(0),
-                        max = feature_max.unsqueeze(0).unsqueeze(0),
-                        bit=bits, tensor=sparse_feats
-                )
-                else:
-                    Z_hat_batch = Z_batch
+                
+                # 2. Extract our perfectly synchronized tensors
+                clean_acts = hook_cache['clean_acts']
+                recon_acts = hook_cache['recon_acts']
+                Z_batch = hook_cache['Z']
+                Z_hat_batch = hook_cache['Z_hat']
+
                 Z = Z_batch.view(-1, Z_batch.size(-1))
                 Z_hat = Z_hat_batch.view(-1, Z_batch.size(-1))
+                Z_all.append(Z)
+                Z_hat_all.append(Z_hat)
+                # 3. Compute Metrics
+                if bits is not None:
+                    total_mse += nn.MSELoss()(recon_acts, clean_acts).item()
+                    total_sds += SDS(Z=Z, Z_hat=Z_hat, k=32)
+                    total_cka += CKA(X=recon_acts.view(-1, clean_acts.size(-1)), Y = clean_acts.view(-1, clean_acts.size(-1)))
 
-                recon_acts = sae_model.decoder(Z_hat_batch)
+                # 4. Save UMAP Data
+                Z_hat_np = Z_hat.detach().cpu().numpy()
                 
-                total_mse += nn.MSELoss()(recon_acts, clean_acts).item()
-                total_sds += SDS(Z=Z, Z_hat=Z_hat, k=32)
-                total_cka += CKA(X=recon_acts.view(-1, 768), Y = clean_acts.view(-1, 768))
+                if bits is None:
+                    if mode == "per_tensor": 
+                        umap_data["Baseline"].append(Z_hat_np)
+                else: 
+                    umap_data[f"{mode}"][f"{bits}-bit_{mode}"].append(Z_hat_np)
 
-                Z_hat_np = (Z_hat.detach().cpu().numpy())
-                if bits is None: umap_data["Baseline"].append(Z_hat_np)
-                else: umap_data[f"{mode}"][f"{bits}-bit_{mode}"].append(Z_hat_np)
-
-                if idx%500==0:
+                if idx % 500 == 0:
                     wandb.log({
-                    "perplexity": math.exp(total_loss/(idx+1)),
-                    "mse": total_mse / (idx+1) if bits is not None else 0,
-                    "cka": total_cka / (idx+1) if bits is not None else 0,
-                    "sds": total_sds / (idx+1) if bits is not None else 0
+                        "perplexity": math.exp(total_loss/(idx+1)),
+                        "mse": total_mse / (idx+1) if bits is not None else 0,
+                        "cka": total_cka / (idx+1) if bits is not None else 0,
+                        "sds": total_sds / (idx+1) if bits is not None else 0
                     })
-                idx+=1
+                idx += 1
+        Z_full = torch.cat(Z_all)
+        Z_hat_full = torch.cat(Z_hat_all)
+
+        global_sds = SDS(Z_full, Z_hat_full, k=32)
+        wandb.log({
+            "global_sds": global_sds
+        })
         avg_loss = total_loss / len(eval_batches)
         print(f"Perplexity: {math.exp(avg_loss):.2f}")
 
@@ -274,7 +277,8 @@ for mode in modes:
         if handle:
             handle.remove()
 
-wandb.finish()
+        wandb.finish()
+
 print("Running UMAP...")
 for mode in modes:
     reducer = umap.UMAP(metric='euclidean', min_dist=0.1, random_state=67)
