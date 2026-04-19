@@ -7,7 +7,6 @@ import random
 from tqdm.auto import tqdm
 import os
 import numpy as np
-
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import math
 import wandb
@@ -21,29 +20,36 @@ model.eval()
 
 m_bottleneck = 512
 
-class TopKSAE(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
+class VAE(nn.Module):
+    def __init__(self, input_dim=768, latent_dim=1024):
         super().__init__()
-        self.encoder = nn.Linear(input_dim, hidden_dim)
-        self.decoder = nn.Linear(hidden_dim, input_dim)
-        self.k = int(hidden_dim * k_percent)
+        self.encoder = nn.Linear(input_dim, 2 * latent_dim)  # mu + logvar
+        self.decoder = nn.Linear(latent_dim, input_dim)
+
+    def encode(self, x):
+        h = self.encoder(x)
+        mu, logvar = torch.chunk(h, 2, dim=-1)
+        return mu, logvar
+
+    def reparam(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
     def forward(self, x):
-        encoded = self.encoder(x)
-        topk_values, topk_indices = torch.topk(encoded, self.k, dim=-1)
-        sparse_encoded = torch.zeros_like(encoded)
-        sparse_encoded.scatter_(-1, topk_indices, topk_values)
-        reconstructed = self.decoder(sparse_encoded)
-        return reconstructed, sparse_encoded
+        mu, logvar = self.encode(x)
+        z = self.reparam(mu, logvar)
+        recon = self.decoder(z)
+        return recon, z, mu, logvar
 
-sae_model = TopKSAE(hidden_dim=m_bottleneck).to(device)
+vae_model = VAE(hidden_dim=m_bottleneck).to(device)
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 weights_folder = os.path.join(current_script_dir, "weights")
-model_file_name = f"sae_m{m_bottleneck}_final_100k.pt"
+model_file_name = f"vae_m{m_bottleneck}_final_100k.pt"
 final_weights_path = os.path.join(weights_folder, model_file_name)
 
-sae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
-sae_model.eval()
+vae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
+vae_model.eval()
 
 dataset = load_dataset("openwebtext", split="train", streaming=True)
 skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
@@ -71,9 +77,9 @@ def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
                 if batches_yielded >= num_batches:
                     return # Stop the generator once we hit our eval limit
                 
-def compute_jacobian_norms(sae_model, acts):
+def compute_jacobian_norms(vae_model, acts):
     acts = acts.clone().detach().requires_grad_(True)
-    _, feats = sae_model(acts)
+    _, feats, _, _ = vae_model(acts)
 
     D = feats.size(-1)
     J = torch.zeros(D, device=acts.device)
@@ -172,7 +178,7 @@ def spectral_analysis(Z, Z_hat, k=32):
         "sds": sds
     }
 
-def compute_calibration_subspace(model, sae_model, calib_batches, device, k=64):
+def compute_calibration_subspace(model, vae_model, calib_batches, device, k=64):
     Z_calib_all = []
 
     with torch.no_grad():
@@ -189,7 +195,7 @@ def compute_calibration_subspace(model, sae_model, calib_batches, device, k=64):
                 x = model.transformer.h[i](x)[0]
 
             acts = x
-            _, Z = sae_model(acts)
+            _, Z = vae_model(acts)
 
             Z_calib_all.append(Z.view(-1, Z.size(-1)))
 
@@ -209,7 +215,7 @@ eval_batches = list(get_eval_batches(skip_dataset, num_batches=5))
 
 Vk_global, mean_global = compute_calibration_subspace(
     model,
-    sae_model,
+    vae_model,
     calib_batches,
     device,
     k=64
@@ -230,7 +236,7 @@ with torch.no_grad():
             x = model.transformer.h[i](x)[0]
         
         acts = x # This is now the actual input Layer 3 expects
-        _, sparse_feats = sae_model(acts) 
+        _, sparse_feats, _, _ = vae_model(acts) 
         batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
         batch_max = sparse_feats.amax(dim=(0,1))
 
@@ -263,14 +269,14 @@ umap_data = {
 
 results = {}
 def get_quant_hook(mode, bits,
-                   sae_model,
+                   vae_model,
                    global_min, global_max,
                    feature_min=None, feature_max=None,
                    Vk=None, mean=None):
 
     def hook(module, input, output):
         acts = output[0]
-        _, Z = sae_model(acts)
+        _, Z = vae_model(acts)
 
         if bits is None:
             return output  # baseline
@@ -292,7 +298,7 @@ def get_quant_hook(mode, bits,
         else:
             raise ValueError(mode)
 
-        recon = sae_model.decoder(Z_hat)
+        recon = vae_model.decoder(Z_hat)
         return (recon,) + output[1:]
 
     return hook
@@ -318,7 +324,7 @@ for mode in modes:
         max_samples = 5
         label = f"{bits}-bit" if bits else "Baseline"
         wandb.init(
-        project="sae-quantization-pt3",
+        project="vae-quantization",
         name=f"{mode}_{label}_analysis",
         reinit=True
         )
@@ -343,7 +349,7 @@ for mode in modes:
                     x = model.transformer.h[i](x)[0]
 
                 clean_acts = x
-                _, sparse_feats = sae_model(clean_acts)
+                _, sparse_feats, _, _ = vae_model(clean_acts)
 
                 Z_batch = sparse_feats
                 if len(acts_samples) < max_samples:
@@ -380,7 +386,7 @@ for mode in modes:
                 Z_hat_all.append(Z_hat)
                 tokens_all.append(batch.view(-1))
 
-                recon_acts = sae_model.decoder(Z_hat_batch)
+                recon_acts = vae_model.decoder(Z_hat_batch)
                 
                 Z_hat_np = (Z_hat.detach().cpu().numpy())
                 if bits is None: umap_data["Baseline"].append(Z_hat_np)
@@ -389,7 +395,7 @@ for mode in modes:
         jacobian = None
 
         for acts in acts_samples:
-            J = compute_jacobian_norms(sae_model, acts)
+            J = compute_jacobian_norms(vae_model, acts)
             
             if jacobian is None:
                 jacobian = J
@@ -406,7 +412,7 @@ for mode in modes:
         hook_fn = get_quant_hook(
             mode=mode,
             bits=bits,
-            sae_model=sae_model,
+            vae_model=vae_model,
             global_min=global_min,
             global_max=global_max,
             feature_min=feature_min,
@@ -439,14 +445,13 @@ for mode in modes:
         mean_angle = angles.mean().item()
         max_angle = angles.max().item()
 
-        def sparsity(x):
-            return (x == 0).float().mean().item()
-
-        s_before = sparsity(Z)
-        s_after = sparsity(Z_hat)
+        def value_ratio(x):
+            return (torch.abs(x) < 1e-3).float().mean()
+        s_before = value_ratio(Z)
+        s_after = value_ratio(Z_hat)
 
         # how much sparsity changed
-        sparsity_delta = s_after - s_before
+        value_delta = s_after - s_before
             
         wandb.log({
             "Perplexity": ppl,
@@ -454,9 +459,9 @@ for mode in modes:
             "fisher_mean": fisher.mean().item(),
             "collapse_ratio": collapse_ratio,
             "energy_loss": energy_loss,
-            "sparsity_before": s_before,
-            "sparsity_after": s_after,
-            "sparsity_delta": sparsity_delta,
+            "value_before": s_before,
+            "value_after": s_after,
+            "value_delta": value_delta,
             "angle_mean": mean_angle,
             "angle_max": max_angle,
             "CKA": cka,
