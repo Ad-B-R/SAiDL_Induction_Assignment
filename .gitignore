@@ -9,3 +9,4 @@ sae_checkpoints/
 *.pt
 *.pth
 tmp_owt_cache/
+clean_env/

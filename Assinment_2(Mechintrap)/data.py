@@ -1,5 +1,11 @@
+import huggingface_hub
+
+if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
+    def dummy(*args, **kwargs):
+        return None
+    huggingface_hub.split_torch_state_dict_into_shards = dummy
+from transformer_lens import HookedTransformer
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,12 +14,17 @@ import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
-model = AutoModelForCausalLM.from_pretrained("distilgpt2")
-model.eval()
+model = HookedTransformer.from_pretrained("distilgpt2")
 model.to(device)
+model.eval()
+
+tokenizer = model.tokenizer
+
+# Hook point (layer 3 input)
+hook_point = "blocks.2.hook_resid_pre"
 
 dataset = load_dataset("openwebtext", split="train", streaming=True)
+
 
 def get_activation_batches(dataset, batch_size=1024, seq_len=128):
     batch_texts = []
@@ -34,7 +45,6 @@ def get_activation_batches(dataset, batch_size=1024, seq_len=128):
                 batch_texts = []
 
 dataset_loader = get_activation_batches(dataset, batch_size=64)
-activations_cache = {} 
 
 class TopKSAE(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
@@ -56,13 +66,8 @@ class TopKSAE(nn.Module):
         reconstructed = self.decoder(sparse_encoded)
         return reconstructed, sparse_encoded
 
-def hook_fn(module, input, output):
-    activations_cache["layer_3"] = output[0].detach().half() 
-
-hook_handle = model.transformer.h[2].register_forward_hook(hook_fn)
-
 # model(dummy_input)
-m_bottleneck = 512*2
+m_bottleneck = 512
 os.makedirs("./sae_checkpoints_64", exist_ok=True)
 
 sae_model = TopKSAE(input_dim=768, hidden_dim=m_bottleneck).to(device)
@@ -74,15 +79,11 @@ scaler = torch.amp.GradScaler('cuda')
 
 for step, batch_loaded in enumerate(dataset_loader):
     batch_loaded = batch_loaded.to(device)
-    
-    with torch.no_grad():
-        with torch.autocast(device_type='cuda', dtype=torch.float16):
-            out = model(batch_loaded)
+    hook_point = "blocks.2.hook_resid_pre"
 
-    layer_3_acts = activations_cache["layer_3"]
-    activations_cache.clear() # Prevent memory leaks
-    
-    del out
+    with torch.no_grad():
+        _, cache = model.run_with_cache(batch_loaded, names_filter=[hook_point])
+        layer_3_acts = cache[hook_point].detach().half()
     flat_acts = layer_3_acts.view(-1, 768).to(torch.float32) # Move back to float32 for SAE math stability
     
     mean = flat_acts.mean(dim=0, keepdim=True)
@@ -124,5 +125,4 @@ final_path = f"./sae_m{m_bottleneck}_final_100k.pt"
 torch.save(sae_model.state_dict(), final_path)
 print(f"Final model saved locally at: {final_path}")
 
-hook_handle.remove()
 torch.save(sae_model.state_dict(), "distilgpt2_layer3_sae_100k.pt")
