@@ -3,14 +3,15 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import random
 from tqdm.auto import tqdm
 import os
+import numpy as np
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import math
 import wandb
-from datasets import load_dataset, load_from_disk, Dataset
+from datasets import load_dataset
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -18,7 +19,7 @@ tokenizer = AutoTokenizer.from_pretrained("distilgpt2")
 model = AutoModelForCausalLM.from_pretrained("distilgpt2").to(device)
 model.eval()
 
-m_bottleneck = 512
+m_bottleneck = 512*2
 
 class TopKSAE(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
@@ -35,8 +36,6 @@ class TopKSAE(nn.Module):
         reconstructed = self.decoder(sparse_encoded)
         return reconstructed, sparse_encoded
 
-current_script_dataset = os.path.dirname(os.path.abspath(__file__))
-dataset_folder = os.path.join(current_script_dataset, "tmp_owt_cache")
 sae_model = TopKSAE(hidden_dim=m_bottleneck).to(device)
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
 weights_folder = os.path.join(current_script_dir, "weights")
@@ -46,24 +45,8 @@ final_weights_path = os.path.join(weights_folder, model_file_name)
 sae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
 sae_model.eval()
 
-if os.path.exists(dataset_folder):
-    dataset = load_from_disk(dataset_folder)
-else:
-    stream = load_dataset("openwebtext", split="train", streaming=True)
-
-    buffer = []
-    for i, example in enumerate(stream):
-        if i % 1000 == 0:
-            print(f"Downloaded {i} samples")
-        if i >= 100000:   # choose size
-            break
-        
-        buffer.append(example)
-
-    dataset = Dataset.from_list(buffer)
-    dataset.save_to_disk(dataset_folder)
-
-skip_dataset = dataset.to_iterable_dataset()
+dataset = load_dataset("openwebtext", split="train", streaming=True)
+skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
 
 
 def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
@@ -150,12 +133,35 @@ def spectral_analysis(Z, Z_hat, k=32):
         "sds": sds
     }
 
+def run_subset_ablation(model, sae_model, eval_batches, neurons, device):
+    def compute_loss():
+        total_loss = 0
+        with torch.no_grad():
+            for batch in eval_batches:
+                outputs = model(batch, labels=batch)
+                total_loss += outputs.loss.item()
+        return math.exp(total_loss / len(eval_batches))
+
+    baseline_ppl = compute_loss()
+
+    def hook(module, input, output):
+        acts = output[0]
+        _, feats = sae_model(acts)
+
+        feats[..., neurons] = 0  
+
+        recon = sae_model.decoder(feats)
+        return (recon,) + output[1:]
+
+    handle = model.transformer.h[2].register_forward_hook(hook)
+    ablated_ppl = compute_loss()
+    handle.remove()
+
+    return (ablated_ppl - baseline_ppl)/abs(baseline_ppl+1e-9)
+
 def run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=512):
     results = {}
     
-    # Ensure no leftover hooks are ruining the baseline
-    model.transformer.h[2]._forward_hooks.clear()
-
     def compute_ppl():
         total_loss = 0
         with torch.no_grad():
@@ -171,37 +177,43 @@ def run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=512
         def hook(module, input, output, neuron=n):
             acts = output[0]
             _, feats = sae_model(acts)
-            neuron_act = feats[..., neuron].unsqueeze(-1)
-            neuron_dir = sae_model.decoder.weight[:, neuron]
-            ablated_acts = acts - (neuron_act * neuron_dir)
+            feats[..., neuron] = 0
+
+            ablated_acts = sae_model.decoder(feats)
             return (ablated_acts,) + output[1:]
 
         handle = model.transformer.h[2].register_forward_hook(hook)
         ablated_ppl = compute_ppl()
-        results[n] = ablated_ppl - baseline_ppl
+        results[n] = (ablated_ppl - baseline_ppl)/abs(baseline_ppl+1e-9)
         handle.remove()
 
     return results
 
-def compute_strict_alignment(l2_scores, kl_scores, ablation_dict):
-    # 1. Convert dict to array spanning 0-511
+def compute_strict_alignment(l2_scores, kl_scores, ablation_dict, k_top=20):
+    # 1. Convert dict to array spanning 0-511'=
     ablation_array = [ablation_dict[i] for i in range(len(l2_scores))]
-    
-    l2_corr, _ = spearmanr(l2_scores.cpu().numpy(), ablation_array)
-    kl_corr, _ = spearmanr(kl_scores.cpu().numpy(), ablation_array)
+    l2_np = l2_scores.cpu().numpy()
+    kl_np = kl_scores.cpu().numpy()
+    ablation_array = np.array(ablation_array)
 
-    k = 10
-    l2_top = set(torch.topk(l2_scores, k).indices.tolist())
-    kl_top = set(torch.topk(kl_scores, k).indices.tolist())
+    l2_np = (l2_np - l2_np.mean())/(l2_np.std() + 1e-9)
+    kl_np = (kl_np - kl_np.mean())/(kl_np.std() + 1e-9)
+    ablation_array = (ablation_array - ablation_array.mean())/(ablation_array.std() + 1e-9)
+
+    l2_corr, _ = spearmanr(l2_np, ablation_array)
+    kl_corr, _ = spearmanr(kl_np, ablation_array)
+
+    l2_top = set(torch.topk(l2_scores, k_top).indices.tolist())
+    kl_top = set(torch.topk(kl_scores, k_top).indices.tolist())
     
     sorted_ablation = sorted(ablation_dict.items(), key=lambda x: x[1], reverse=True)
-    impactful_top = set([n for n, _ in sorted_ablation[:k]])
+    impactful_top = set([n for n, _ in sorted_ablation[:k_top]])
     
     return {
         "spearman_l2": float(l2_corr),
         "spearman_kl": float(kl_corr),
-        "l2_overlap": len(l2_top & impactful_top) / k,
-        "kl_overlap": len(kl_top & impactful_top) / k
+        "l2_overlap": len(l2_top & impactful_top) / k_top,
+        "kl_overlap": len(kl_top & impactful_top) / k_top
     }
 
 def get_top_tokens(Z, tokens, neurons, k=10):
@@ -217,28 +229,6 @@ print("\nCalibrating Min/Max ranges on held-out data...")
 calib_batches = list(get_eval_batches(skip_dataset, num_batches=1))
 global_min, global_max = float('inf'), float('-inf')
 feature_min, feature_max = None, None
-
-def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
-    batch_texts = []
-    token_buffer = []
-    batches_yielded = 0
-
-    for example in dataset_stream:
-        tokens = tokenizer(example["text"], return_tensors="pt")["input_ids"][0]
-        token_buffer.extend(tokens.tolist())
-
-        while len(token_buffer) >= seq_len:
-            chunk = token_buffer[:seq_len:1]
-            token_buffer = token_buffer[seq_len::1]
-
-            batch_texts.append(torch.tensor(chunk).unsqueeze(0)) 
-
-            if len(batch_texts) == batch_size:
-                yield torch.cat(batch_texts, dim=0).to(device)
-                batch_texts = []
-                batches_yielded += 1
-                if batches_yielded >= num_batches:
-                    return # Stop the generator once we hit our eval limit
 
 eval_batches = list(get_eval_batches(skip_dataset, num_batches=5))
 
@@ -345,6 +335,7 @@ for mode in modes:
                 Z_hat_np = (Z_hat.detach().cpu().numpy())
                 if bits is None: umap_data["Baseline"].append(Z_hat_np)
                 else: umap_data[f"{mode}"][f"{bits}-bit_{mode}"].append(Z_hat_np)
+
         Z = torch.cat(Z_all)
         Z_hat = torch.cat(Z_hat_all)
         tokens = torch.cat(tokens_all)
@@ -376,24 +367,32 @@ for mode in modes:
         plt.legend()
         plt.title(f"Singular Values ({label})")
 
-        plt.savefig(f"svd_{label}.png", dpi=300, bbox_inches="tight")
+        plt.savefig(f"svd_{label}_m_{m_bottleneck}.png", dpi=300, bbox_inches="tight")
         plt.close()
                 
-        top_neurons_kl = torch.topk(kl, k=10).indices.tolist()
-        top_neurons_l2 = torch.topk(l2, k=10).indices.tolist()
+        k = 20
 
-        top_tokens_kl = get_top_tokens(Z, tokens, top_neurons_kl)
-        top_tokens_l2 = get_top_tokens(Z, tokens, top_neurons_l2)
-        
+        top_neurons_kl = torch.topk(kl, k=k).indices.tolist()
+        top_neurons_l2 = torch.topk(l2, k=k).indices.tolist()
+
+        top_tokens_kl = get_top_tokens(Z, tokens, top_neurons_kl, k)
+        top_tokens_l2 = get_top_tokens(Z, tokens, top_neurons_l2, k)
+
         print("\nTop KL neurons + tokens:")
         for n, toks in top_tokens_kl.items():
-            print(f"Neuron {n}: {toks[:10]}")
+            print(f"Neuron {n}: {toks[:k]}")
 
         print("\nTop L2 neurons + tokens:")
         for n, toks in top_tokens_l2.items():
-            print(f"Neuron {n}: {toks[:10]}")
+            print(f"Neuron {n}: {toks[:k]}")
 
         global_ablation = run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=m_bottleneck)
+
+        random_neurons = random.sample(range(len(l2)), k)
+
+        delta_l2 = run_subset_ablation(model, sae_model, eval_batches, top_neurons_l2, device)
+        delta_kl = run_subset_ablation(model, sae_model, eval_batches, top_neurons_kl, device)
+        delta_rand = run_subset_ablation(model, sae_model, eval_batches, random_neurons, device)
         
         alignment_stats = compute_strict_alignment(l2, kl, global_ablation)
 
@@ -404,6 +403,9 @@ for mode in modes:
             "alignment/l2_overlap": alignment_stats['l2_overlap'],
             "alignment/kl_overlap": alignment_stats['kl_overlap'],
             "ablation/max_delta_ppl": max(global_ablation.values()),
+            "ablation/l2_delta_loss": delta_l2,
+            "ablation/kl_delta_loss": delta_kl,
+            "ablation/random_delta_loss": delta_rand,
             "ablation/mean_delta_ppl": sum(global_ablation.values()) / len(global_ablation)
         })
         results[bits] = {
@@ -435,3 +437,6 @@ for mode in modes:
         
         print(f"Top 10 L2 Overlap: {alignment_stats['l2_overlap'] * 100:.1f}%")
         print(f"Top 10 KL Overlap: {alignment_stats['kl_overlap'] * 100:.1f}%")
+
+print("<------------------- ABLATION FINISHED --------------------------->")
+print("<------------------- SUCCESS --------------------------->")
