@@ -1,10 +1,7 @@
 from datasets import load_dataset
 import huggingface_hub
-
-if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
-    def dummy(*args, **kwargs):
-        return None
-    huggingface_hub.split_torch_state_dict_into_shards = dummy
+import sys
+import types
 from transformer_lens import HookedTransformer
 import torch
 import torch.nn as nn

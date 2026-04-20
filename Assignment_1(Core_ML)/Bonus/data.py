@@ -1,23 +1,24 @@
 import torch
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
-from omegaconf import DictConfig, OmegaConf
 from datasets import load_dataset
-
+import json
 
 class GeneralizedDataset(Dataset):
     def __init__(self, seq_len: int, split: str = "train"):
         self.seq_len = seq_len
         tokenizer = tiktoken.get_encoding("gpt2")
         
-        # 1. Load dataset
-        hf_data = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
+        # 1. Load Tiny Shakespeare dataset
+        hf_data = load_dataset("tiny_shakespeare", split=split)
         
         print(f"Tokenizing {split} split...")
         token_list = []
         
         eos_id = tokenizer.encode("<|endoftext|>", allowed_special={'<|endoftext|>'})[0]
 
+        # Tiny Shakespeare contains very few rows (often just one massive string per split), 
+        # so this loop runs virtually instantly.
         for text in hf_data["text"]:
             if len(text.strip()) > 0:
                 token_list.extend(tokenizer.encode(text))
@@ -37,6 +38,9 @@ class GeneralizedDataset(Dataset):
             "labels": chunk[1:]
         }
             
-def create_dataloader(cfg: DictConfig, split: str, shuffle: bool = True):
-    dataset = GeneralizedDataset(cfg.seq_len, split)
-    return DataLoader(dataset, cfg.batch_size, shuffle=shuffle)
+def create_dataloader(split: str, shuffle: bool = True):
+    with open('data.json', 'r') as file:
+        data = json.load(file)
+    dataset = GeneralizedDataset(data['seq_len'], split)
+    
+    return DataLoader(dataset, batch_size=data['batch_size'], shuffle=shuffle)

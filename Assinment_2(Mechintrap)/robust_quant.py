@@ -1,12 +1,5 @@
 import huggingface_hub
-
-# 2. Fake the missing function that is causing BERT to crash
-if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
-    huggingface_hub.split_torch_state_dict_into_shards = lambda *args, **kwargs: None
-
-# 3. Now the scanner will pass BERT safely, and this will work:
 from transformer_lens import HookedTransformer
-from scipy.stats import spearmanr
 from datasets import load_dataset
 import torch
 import torch.nn as nn
@@ -27,7 +20,7 @@ model = model.to(device)
 model.eval()
 
 tokenizer = model.tokenizer
-
+k = 0
 m = [512,1024]
 for m_bottleneck in m:
     class TopKSAE(nn.Module):
@@ -80,22 +73,28 @@ for m_bottleneck in m:
                     batches_yielded += 1
                     if batches_yielded >= num_batches:
                         return # Stop the generator once we hit our eval limit
-                    
+                        
     def compute_jacobian_norms(sae_model, acts):
         acts = acts.clone().detach().requires_grad_(True)
-        _, feats = sae_model(acts)
 
-        D = feats.size(-1)
-        J = torch.zeros(D, device=acts.device)
+        B, T, D = acts.shape
+        flat = acts.view(-1, D)
 
-        for i in range(D):
-            grad = torch.autograd.grad(
-                feats[..., i].sum(), acts,
-                retain_graph=True
-            )[0]
-            J[i] = grad.norm()
+        _, Z = sae_model(flat)  # [N, F]
 
-        return J
+        grad_outputs = torch.ones_like(Z)
+
+        grads = torch.autograd.grad(
+            outputs=Z,
+            inputs=acts,
+            grad_outputs=grad_outputs,
+            retain_graph=False
+        )[0]
+
+        # map to feature importance (approx)
+        importance = Z.abs().mean(dim=0)
+
+        return importance
 
     def compute_fisher(Z):
         return (Z ** 2).mean(dim=0)
@@ -125,19 +124,31 @@ for m_bottleneck in m:
         Z_res = Zc - Z_proj
 
         return Z_proj, Z_res
-
+    def get_range(x, p=0.999):
+        high = torch.quantile(x, p)
+        low = torch.quantile(x, 1 - p)
+        return low, high
+ 
     def subspace_quantize(Z, Vk, mean, bits_high=8, bits_low=2,
-                        min_val=None, max_val=None):
+                          min_val=None, max_val=None):
 
+        sparsity_mask = (Z != 0.0).float()
+
+        # 2. Decompose
         Z_proj, Z_res = decompose_subspace(Z, Vk, mean)
 
-        Z_proj_q = quantize_gen(min_val, max_val, bits_high, Z_proj)
-        res_min = Z_res.min()
-        res_max = Z_res.max()
-
+        # 4. Quantize Residual
+        proj_min, proj_max = get_range(Z_proj)
+        res_min, res_max = get_range(Z_res)
+        
+        Z_proj_q = quantize_gen(proj_min, proj_max, bits_high, Z_proj)
+        
         Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
 
+        # 5. Recombine
         Z_hat = Z_proj_q + Z_res_q + mean
+
+        Z_hat = Z_hat * sparsity_mask
 
         return Z_hat
 
@@ -241,9 +252,58 @@ for m_bottleneck in m:
                 feature_max = torch.maximum(feature_max, batch_max)
 
     print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
+    def normalize(x):
+        return (x - x.mean()) / (x.std() + 1e-8)    
+  
+    def compute_importance(k):
+        all_Z = []
+        acts_samples = []
+        max_samples = 5  
+        with torch.no_grad():
+            for batch in eval_batches:
+                _, cache = model.run_with_cache(batch)
+                acts = cache["blocks.2.hook_resid_pre"]
+                if len(acts_samples) < max_samples:
+                    acts_samples.append(acts.detach())
 
+                B, T, D = acts.shape
+                flat = acts.view(-1, D)
 
+                _, Z_flat = sae_model(flat)
+                Z = Z_flat.view(B, T, -1)
+
+                all_Z.append(Z)
+
+        Z = torch.cat(all_Z, dim=0)
+
+        Z_flat = Z.view(-1, Z.size(-1))
+        jacobian_imp = None
+
+        for acts in acts_samples:
+            J = compute_jacobian_norms(sae_model, acts)
+
+            if jacobian_imp is None:
+                jacobian_imp = J
+            else:
+                jacobian_imp += J
+
+        jacobian_imp /= len(acts_samples)
+        fisher_imp   = compute_fisher(Z_flat)
+
+        F = Z_flat.size(-1)
+        k_val = int(F*k)
+        importance = normalize(jacobian_imp) + normalize(fisher_imp)
+        Z_weighted = Z_flat * importance
+
+        U, S, V = torch.svd(Z_weighted)
+        Vk_global = V[:, :k_val]
+    
+        return Vk_global
+    
+    Vk_global = compute_importance(k=0.02)
+    
     bit_configs = [4, 2, None]
+
     modes = ["per_tensor", "subspace"]
     umap_data = {
         "Baseline": [],
@@ -277,7 +337,7 @@ for m_bottleneck in m:
                 Z_flat = Z.view(-1, Z.size(-1))
 
                 Z_hat_flat = subspace_quantize(
-                    Z_flat, Vk, mean,
+                    Z_flat, Vk_global, mean,
                     bits_high=8,
                     bits_low=bits,
                     min_val=global_min,
@@ -321,7 +381,6 @@ for m_bottleneck in m:
             name=f"{mode}_{label}_analysis",
             reinit=True
             )
-            label = f"{bits}-bit" if bits else "Baseline"
             print(f"\nEvaluating: {label}")
             Z_all = []
             Z_hat_all = []
@@ -334,9 +393,11 @@ for m_bottleneck in m:
 
                     _, cache = model.run_with_cache(batch)
                     clean_acts = cache["blocks.2.hook_resid_pre"]
-                    _, sparse_feats = sae_model(clean_acts)
+                    B, T, D = clean_acts.shape
+                    flat = clean_acts.view(-1, D)
 
-                    Z_batch = sparse_feats
+                    _, sparse_feats_flat = sae_model(flat)
+                    Z_batch = sparse_feats_flat.view(B, T, -1)
                     if len(acts_samples) < max_samples:
                         acts_samples.append(clean_acts[:1].detach())    
                     
@@ -344,7 +405,7 @@ for m_bottleneck in m:
                         if mode == "subspace":
                         # Flatten for SVD
                             Z_flat = Z_batch.view(-1, Z_batch.size(-1))
-
+                        
                             Z_hat_flat = subspace_quantize(
                                 Z_flat, Vk_global, mean_global,
                                 bits_high=8,
@@ -400,15 +461,14 @@ for m_bottleneck in m:
                 sae_model=sae_model,
                 global_min=global_min,
                 global_max=global_max,
-                feature_min=feature_min,
-                feature_max=feature_max,
                 Vk=Vk_global,
                 mean=mean_global
             )
 
             ppl = compute_ppl_with_hook(model, eval_batches, hook_fn)
 
-            print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
+            if bits is not None: print(f"{mode*2} | {bits}-bit → PPL: {ppl:.2f}")
+            else: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
             spectral = spectral_analysis(Z, Z_hat)
 
             fisher = compute_fisher(Z)
@@ -440,6 +500,7 @@ for m_bottleneck in m:
             sparsity_delta = s_after - s_before
                 
             wandb.log({
+                "k_value": k,
                 "Perplexity": ppl,
                 "jacobian_mean": jacobian.mean().item(),
                 "fisher_mean": fisher.mean().item(),

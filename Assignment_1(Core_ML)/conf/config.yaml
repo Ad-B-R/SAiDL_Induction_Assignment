@@ -15,5 +15,3 @@ h: 8
 d_ff: 1024         
 num_layers: 4      
 dropout: 0.1   
-
-

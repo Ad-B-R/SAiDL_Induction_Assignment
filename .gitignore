@@ -10,3 +10,4 @@ sae_checkpoints/
 *.pth
 tmp_owt_cache/
 clean_env/
+tea_debug.log

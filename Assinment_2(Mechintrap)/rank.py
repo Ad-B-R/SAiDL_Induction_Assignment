@@ -1,9 +1,5 @@
 import huggingface_hub
 
-# 2. Fake the missing function that is causing BERT to crash
-if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
-    huggingface_hub.split_torch_state_dict_into_shards = lambda *args, **kwargs: None
-
 # 3. Now the scanner will pass BERT safely, and this will work:
 from transformer_lens import HookedTransformer
 from scipy.stats import spearmanr
@@ -20,7 +16,7 @@ import wandb
 from datasets import load_dataset
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
+print(device)
 
 model = HookedTransformer.from_pretrained("distilgpt2")
 model = model.to(device)
@@ -28,7 +24,7 @@ model.eval()
 
 tokenizer = model.tokenizer
 
-m = [512,1024]
+m = [1024]
 for m_bottleneck in m:
     class TopKSAE(nn.Module):
         def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
@@ -80,14 +76,30 @@ for m_bottleneck in m:
                     if batches_yielded >= num_batches:
                         return # Stop the generator once we hit our eval limit
 
+    def get_range(x, p=0.999):
+        high = torch.quantile(x, p, dim=(0,1), keepdim=True)
+        low  = torch.quantile(x, 1 - p, dim=(0,1), keepdim=True)
+        return low, high
+
     def quantize_gen(min, max, bit, tensor):
         q_max = int(2**bit - 1)
         s = (max-min)/(q_max + 1e-9)
         shift = tensor - min
         q = torch.round(shift/(s + 1e-9))
         q_clip = torch.clamp(q, 0, q_max)
-        de_quantize = (q_clip*s) + min
-        return de_quantize
+        return (q_clip*s) + min
+
+    def flatten_sae_forward(acts, sae_model):
+        B, T, D = acts.shape
+        flat = acts.view(-1, D)
+        _, feats = sae_model(flat)
+        return feats.view(B, T, -1)
+
+    def decode_sae(feats, sae_model):
+        B, T, H = feats.shape
+        flat = feats.view(-1, H)
+        recon = sae_model.decoder(flat)
+        return recon.view(B, T, -1)
 
     def compute_neuron_scores(Z, Z_hat, bins=50):
         # L2 (normalized)
@@ -163,17 +175,25 @@ for m_bottleneck in m:
         baseline_ppl = compute_loss_with_hook()
 
         def hook_fn(activations, hook):
-            acts = activations
-            _, feats = sae_model(acts)
-            feats[..., neurons] = 0
-            recon = sae_model.decoder(feats)
-            return recon
+            B, T, D = activations.shape
+            flat = activations.view(-1, D)
+            _, feats = sae_model(flat)
+            feats = feats.view(B, T, -1)
+
+            ablated_acts = activations.clone()
+            
+            for n in neurons:
+                neuron_act = feats[..., n].unsqueeze(-1)
+                neuron_dir = sae_model.decoder.weight[:, n].view(1, 1, D)
+                ablated_acts = ablated_acts - (neuron_act * neuron_dir)
+
+            return ablated_acts
 
         ablated_ppl = compute_loss_with_hook(hook_fn)
-
-        return (ablated_ppl - baseline_ppl)/abs(baseline_ppl+1e-9)
+        return (ablated_ppl - baseline_ppl) / abs(baseline_ppl + 1e-9)
 
     def run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=512):
+    
         results = {}
 
         def compute_ppl_with_hook(hook_fn=None):
@@ -189,26 +209,31 @@ for m_bottleneck in m:
                             fwd_hooks=[("blocks.2.hook_resid_pre", hook_fn)]
                         )
                         loss = model.loss_fn(logits, batch)
-
                     total_loss += loss.item()
-
             return math.exp(total_loss / len(eval_batches))
 
         baseline_ppl = compute_ppl_with_hook()
 
         for n in tqdm(range(m_bottleneck), desc="Ablating Neurons", leave=False):
-
             def hook_fn(activations, hook, neuron=n):
-                acts = activations
-                _, feats = sae_model(acts)
-                feats[..., neuron] = 0
-                return sae_model.decoder(feats)
+                B, T, D = activations.shape
+                flat = activations.view(-1, D)
+                _, feats = sae_model(flat)
+                feats = feats.view(B, T, -1)
+
+                # THE SCALPEL: Subtract only the specific neuron's contribution
+                neuron_act = feats[..., neuron].unsqueeze(-1) # [B, T, 1]
+                neuron_dir = sae_model.decoder.weight[:, neuron].view(1, 1, D) # [1, 1, D]
+                
+                # Subtract from the ORIGINAL activations
+                ablated_acts = activations - (neuron_act * neuron_dir)
+
+                return ablated_acts
 
             ablated_ppl = compute_ppl_with_hook(hook_fn)
-            results[n] = (ablated_ppl - baseline_ppl)/abs(baseline_ppl+1e-9)
+            results[n] = (ablated_ppl - baseline_ppl) / abs(baseline_ppl + 1e-9)
 
         return results
-
     def compute_strict_alignment(l2_scores, kl_scores, ablation_dict, k_top=20):
         # 1. Convert dict to array spanning 0-511'=
         ablation_array = [ablation_dict[i] for i in range(len(l2_scores))]
@@ -235,16 +260,40 @@ for m_bottleneck in m:
             "l2_overlap": len(l2_top & impactful_top) / k_top,
             "kl_overlap": len(kl_top & impactful_top) / k_top
         }
-
-    def get_top_tokens(Z, tokens, neurons, k=10):
+    def get_top_tokens_with_context(Z, tokens, neurons, k=10, context_size=3):
         results = {}
-
+        
+        # 1. Mask out the padding tokens so we don't get <|endoftext|> spam
+        pad_id = tokenizer.eos_token_id
+        valid_mask = (tokens != pad_id)
+        
         for n in neurons:
-            vals, idx = torch.topk(Z[:, n], k)
-            results[n] = tokenizer.batch_decode(tokens[idx])
+            z_n = Z[:, n].clone()
+            z_n[~valid_mask] = float('-inf')
+            
+            vals, idx = torch.topk(z_n, k)
+            
+            neuron_contexts = []
+            for i in idx:
+                i_val = i.item()
+                
+                # 2. Grab the surrounding tokens (preventing out-of-bounds errors)
+                start = max(0, i_val - context_size)
+                end = min(tokens.size(0), i_val + 1)
+                
+                # 3. Decode the context window
+                context_str = tokenizer.decode(tokens[start:end])
+                
+                # 4. Highlight the exact token that caused the neuron to fire
+                trigger_token = tokenizer.decode(tokens[i_val])
+                
+                # Format it nicely for the terminal
+                neuron_contexts.append(f"...{context_str}  <-- [FIRED ON: '{trigger_token}']")
+                
+            results[n] = neuron_contexts
+            
         return results
-
-    print("\nCalibrating Min/Max ranges on held-out data...")
+        print("\nCalibrating Min/Max ranges on held-out data...")
 
     calib_batches = list(get_eval_batches(skip_dataset, num_batches=1))
     global_min, global_max = float('inf'), float('-inf')
@@ -257,7 +306,12 @@ for m_bottleneck in m:
                     
             _, cache = model.run_with_cache(batch)
             acts = cache["blocks.2.hook_resid_pre"]
-            _, sparse_feats = sae_model(acts) 
+            B, T, D = acts.shape
+
+            flat = acts.view(-1, D)
+            _, sparse_feats = sae_model(flat)
+
+            Z_batch = sparse_feats.view(B, T, -1)
             batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
             batch_max = sparse_feats.amax(dim=(0,1))
 
@@ -275,7 +329,7 @@ for m_bottleneck in m:
     print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
 
 
-    bit_configs = [8, 6, 4, 2, None]
+    bit_configs = [6, 4, 2, None]
     modes = ["per_tensor"]
     umap_data = {
         "Baseline": [],
@@ -312,14 +366,18 @@ for m_bottleneck in m:
                 for batch in tqdm(eval_batches, leave=False):
                     _, cache = model.run_with_cache(batch)
                     clean_acts = cache["blocks.2.hook_resid_pre"]
-                    _, sparse_feats = sae_model(clean_acts)
+                    B, T, D = clean_acts.shape
 
-                    Z_batch = sparse_feats
+                    flat = clean_acts.view(-1, D)
+                    _, sparse_feats = sae_model(flat)
 
+                    Z_batch = sparse_feats.view(B, T, -1)
                     if bits is not None:
+                        low = feature_min.view(1,1,-1)
+                        high = feature_max.view(1,1,-1)
                         Z_hat_batch = quantize_gen(
-                            min=global_min,
-                            max=global_max,
+                            min=low,
+                            max=high,
                             bit=bits,
                             tensor=Z_batch
                         )
@@ -358,7 +416,8 @@ for m_bottleneck in m:
             "l2_hist": wandb.Histogram(l2.cpu().numpy()),
             "kl_hist": wandb.Histogram(kl.cpu().numpy())
             })
-
+            import matplotlib
+            matplotlib.use('Agg') 
             import matplotlib.pyplot as plt
 
             plt.figure()
@@ -377,8 +436,8 @@ for m_bottleneck in m:
             top_neurons_kl = torch.topk(kl, k=k).indices.tolist()
             top_neurons_l2 = torch.topk(l2, k=k).indices.tolist()
 
-            top_tokens_kl = get_top_tokens(Z, tokens, top_neurons_kl, k)
-            top_tokens_l2 = get_top_tokens(Z, tokens, top_neurons_l2, k)
+            top_tokens_kl = get_top_tokens_with_context(Z, tokens, top_neurons_kl, k)
+            top_tokens_l2 = get_top_tokens_with_context(Z, tokens, top_neurons_l2, k)
 
             print("\nTop KL neurons + tokens:")
             for n, toks in top_tokens_kl.items():

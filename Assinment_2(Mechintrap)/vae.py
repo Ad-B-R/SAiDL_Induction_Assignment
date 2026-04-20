@@ -1,9 +1,24 @@
+from datasets import load_dataset
 import huggingface_hub
 
 if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
     def dummy(*args, **kwargs):
         return None
     huggingface_hub.split_torch_state_dict_into_shards = dummy
+import sys
+import types
+
+# Create a fake BERT module so transformers' import scan doesn't crash
+bert_stub = types.ModuleType("transformers.models.bert.modeling_bert")
+
+class _Dummy:  # minimal placeholder
+    pass
+
+bert_stub.BertForPreTraining = _Dummy
+
+sys.modules["transformers.models.bert.modeling_bert"] = bert_stub
+
+    
 from transformer_lens import HookedTransformer
 from datasets import load_dataset
 import torch
@@ -43,7 +58,6 @@ def get_activation_batches(dataset, batch_size=1024, seq_len=128):
                 yield torch.cat(batch_texts, dim=0)
                 batch_texts = []
 
-dataset_loader = get_activation_batches(dataset, batch_size=64)
 
 class VAE(nn.Module):
     def __init__(self, input_dim=768, latent_dim=1024):
@@ -75,6 +89,7 @@ def vae_loss(x, recon, mu, logvar, beta=0.01):
 # model(dummy_input)
 m = [512,1024]
 for m_bottleneck in m:
+    dataset_loader = get_activation_batches(dataset, batch_size=64)
     activations_cache = {} 
     os.makedirs("./vae_checkpoints_64", exist_ok=True)
 
@@ -128,7 +143,7 @@ for m_bottleneck in m:
             break
 
     # Final Save
-    final_path = f"./sae_m{m_bottleneck}_final_100k.pt"
+    final_path = f"./vae_m{m_bottleneck}_final_100k.pt"
     torch.save(vae_model.state_dict(), final_path)
     print(f"Final model saved locally at: {final_path}")
 
