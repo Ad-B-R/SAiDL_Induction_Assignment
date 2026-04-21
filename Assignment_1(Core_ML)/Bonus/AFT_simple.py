@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import math
-from data import create_dataloader
 
 # Run for different context lengths and throughput
 
@@ -70,12 +69,11 @@ class AFTSimple(nn.Module):
     def forward(self, x):
         B, T, D = x.shape
 
-        # ---- projections ----
-        q = torch.sigmoid(self.Wq(x))                  # (B, T, D)
+        q = torch.sigmoid(self.Wq(x))                 
 
         k_logits = self.Wk(x) / math.sqrt(D)
         k_logits = torch.clamp(k_logits, -15, 15)
-        k_exp = torch.exp(k_logits)                    # (B, T, D)
+        k_exp = torch.exp(k_logits)                   
 
         v = self.Wv(x)
 

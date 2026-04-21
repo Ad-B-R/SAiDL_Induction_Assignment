@@ -7,7 +7,7 @@ from data import create_dataloader
 import wandb
 import hydra
 import time
-import AFT as model
+import AFT_full, AFT_local, AFT_simple
 import os
 from omegaconf import DictConfig, OmegaConf
 import matplotlib.pyplot as plt
