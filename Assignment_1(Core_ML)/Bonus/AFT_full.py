@@ -55,60 +55,53 @@ class StandardAttention(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, h:int, dropout:float, 
-                 pos_encoding_fn=None, **kwargs):
+class AFTFull(nn.Module):
+    def __init__(self, d_model: int, max_seq_len: int = 2048, dropout: float = 0.0, **kwargs):
         super().__init__()
         self.d_model = d_model
-        self.h = h
-        self.dropout = dropout
-        assert d_model%h == 0,  "d_model not divisible by h"
-
-        self.d_k = d_model//h
+        self.max_seq_len = max_seq_len
+        
         self.Wq = nn.Linear(d_model, d_model)
         self.Wk = nn.Linear(d_model, d_model)
         self.Wv = nn.Linear(d_model, d_model)
-        
         self.Wo = nn.Linear(d_model, d_model)
+        
+        # Learned pairwise position biases (T_max, T_max)
+        self.pos_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
         self.dropout = nn.Dropout(dropout)
 
+    def forward(self, x, mask=None):
+        B, T, D = x.shape
+        q = torch.sigmoid(self.Wq(x))               
+        k_logits = self.Wk(x) / math.sqrt(D)           
+        k_logits = torch.clamp(k_logits, -20, 20)      
+        k_exp = torch.exp(k_logits)                    
 
-    @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout):
-        d_k = query.shape[-1]
+        v = self.Wv(x)                                 
+        kv = k_exp * v                                 
 
-        # (batch, seq_len, d_k) -> (batch, h, seq_len, seq_len)
-        attention_scores = ((query @ key.transpose(-2,-1))/math.sqrt(d_k))
+        # 2. Positional bias
+        w = self.pos_bias[:T, :T]                      
 
         if mask is not None:
-            attention_scores.masked_fill_(mask == 0, float('-inf'))
-        attention_scores = attention_scores.softmax(dim=-1) # batch, h, seq_len, seq_len
+            mask = mask.squeeze(1)                     
+            w = w.unsqueeze(0).expand(B, T, T)
+            w = w.masked_fill(mask == 0, float('-inf'))
+        else:
+            w = w.unsqueeze(0).expand(B, T, T)
 
-        if dropout is not None:
-            attention_scores = dropout(attention_scores)
-        
-        return (attention_scores @ value), attention_scores
+        w = torch.clamp(w, -10, 10)
+        w_exp = torch.exp(w)
 
+        num = torch.einsum('bti,bid->btd', w_exp, kv)
+        den = torch.einsum('bti,bid->btd', w_exp, k_exp) + 1e-6
 
-    def forward(self, x, mask):
-        # batch, seq len, d_model
-        query = self.Wq(x)
-        value = self.Wv(x)
-        key = self.Wk(x)
-        # batch, seq_len, h, d_k -> batch, h, seq_len, d_k
-        query = query.view(query.shape[0], -1, self.h, self.d_k).transpose(1,2)
-        key = key.view(key.shape[0], -1, self.h, self.d_k).transpose(1,2)
-        # key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).permute([0,2,1,3])
-        value = value.view(value.shape[0], -1, self.h, self.d_k).transpose(1,2)
-        # (batch, h, seq_len, d_k) 
-        x, self.attention_scores = MultiHeadAttention.attention(query, key, value, mask, self.dropout, 
-                                                                )
+        # 6. Output
+        out = q * (num / den)
+        out = self.dropout(out)
 
-        x = x.transpose(1,2)
-        x = x.contiguous().view(x.shape[0], -1, self.h*self.d_k)
-
-        return self.Wo(x)
-
+        return self.Wo(out)
+    
 class InputEmbedding(nn.Module):
     def __init__(self, d_model: int, vocab_size: int, ):
         super().__init__()
@@ -169,4 +162,3 @@ class AttentionBlock(nn.Module):
         # residual_connections__Call__() expects only one input function, hence we do this
         x = self.residual_connections[1](x, self.feed_foward_network)
         return x
-

@@ -1,24 +1,5 @@
 from datasets import load_dataset
-import huggingface_hub
-
-if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
-    def dummy(*args, **kwargs):
-        return None
-    huggingface_hub.split_torch_state_dict_into_shards = dummy
-import sys
-import types
-
-# Create a fake BERT module so transformers' import scan doesn't crash
-bert_stub = types.ModuleType("transformers.models.bert.modeling_bert")
-
-class _Dummy:  # minimal placeholder
-    pass
-
-bert_stub.BertForPreTraining = _Dummy
-
-sys.modules["transformers.models.bert.modeling_bert"] = bert_stub
-
-    
+import huggingface_hub    
 from transformer_lens import HookedTransformer
 from datasets import load_dataset
 import torch
@@ -38,7 +19,9 @@ tokenizer = model.tokenizer
 # Hook point (layer 3 input)
 hook_point = "blocks.2.hook_resid_pre"
 
+resume_step = 40000
 dataset = load_dataset("openwebtext", split="train", streaming=True)
+skip_dataset = dataset.skip(resume_step)
 
 def get_activation_batches(dataset, batch_size=1024, seq_len=128):
     batch_texts = []
@@ -87,7 +70,7 @@ def vae_loss(x, recon, mu, logvar, beta=0.01):
     return recon_loss + beta * kl
 
 # model(dummy_input)
-m = [512,1024]
+m = [512]
 for m_bottleneck in m:
     dataset_loader = get_activation_batches(dataset, batch_size=64)
     activations_cache = {} 
@@ -97,6 +80,10 @@ for m_bottleneck in m:
     vae_optimizer = optim.Adam(vae_model.parameters(), lr=1e-4)
     vae_criterion = nn.MSELoss()
     vae_optimizer.zero_grad()
+    if resume_step>0:
+        ckpt_path = f"./vae_checkpoints_64/sae_m{m_bottleneck}_step{resume_step}_64.pt"
+        vae_model.load_state_dict(torch.load(ckpt_path, map_location=device))
+        print(f"===== Successfully loaded checkpoint: {ckpt_path} =====")
 
     scaler = torch.amp.GradScaler('cuda')
 
@@ -126,17 +113,17 @@ for m_bottleneck in m:
         scaler.update()
 
         if step % 10 == 0:
-            print(f"Step {step} | SAE Loss (MSE): {loss.item():.4f}")
+            print(f"Step {step+resume_step} | SAE Loss (MSE): {loss.item():.4f}")
 
         # if step >= 200: 
         #     print("Debug pass complete!")
         #     break
 
         if step > 0 and step % 5000 == 0:
-            ckpt_path = f"./sae_checkpoints_64/sae_m{m_bottleneck}_step{step}_64.pt"
+            ckpt_path = f"./vae_checkpoints_64/sae_m{m_bottleneck}_step{step+resume_step}_64.pt"
             torch.save(vae_model.state_dict(), ckpt_path)
             tqdm.write(f"--> Checkpoint saved: {ckpt_path}")
-
+        
         # Stop exactly at 100,000 as requested
         if step >= 100000: 
             print("\nTraining Complete!")
