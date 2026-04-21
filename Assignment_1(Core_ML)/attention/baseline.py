@@ -1,8 +1,6 @@
 import torch
 import torch.nn as nn
 import wandb
-import hydra
-from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 import math
 from data import create_dataloader

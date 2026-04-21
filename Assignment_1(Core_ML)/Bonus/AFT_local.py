@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 from data import create_dataloader
+import torch.nn.functional as F
 
 # Run for different context lengths and throughput
 
@@ -56,7 +57,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class AFTFull(nn.Module):
-    def __init__(self, d_model: int, max_seq_len: int = 2048, dropout: float = 0.0, **kwargs):
+    def __init__(self, d_model: int, max_seq_len: int = 2048, dropout: float = 0.0, window_size = 32, **kwargs):
         super().__init__()
         self.d_model = d_model
         self.max_seq_len = max_seq_len
@@ -66,12 +67,16 @@ class AFTFull(nn.Module):
         self.Wv = nn.Linear(d_model, d_model)
         self.Wo = nn.Linear(d_model, d_model)
         
+        self.window_size = self.window_size
+
         # Learned pairwise position biases (T_max, T_max)
-        self.pos_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
+        self.pos_bias = nn.Parameter(torch.zeros(window_size))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
         B, T, D = x.shape
+        S = self.window_size
+
         q = torch.sigmoid(self.Wq(x))               
         k_logits = self.Wk(x) / math.sqrt(D)           
         k_logits = torch.clamp(k_logits, -20, 20)      
@@ -80,31 +85,25 @@ class AFTFull(nn.Module):
         v = self.Wv(x)                                 
         kv = k_exp * v                                 
 
-        # 2. Positional bias
-        w = self.pos_bias[:T, :T]                      
+        pad_len = S-1
 
-        w = torch.clamp(w, -10, 10)
-        w_exp = torch.exp(w)
+        k_exp_padded = F.pad(k_exp, (0, 0, pad_len, 0))    
+        kv_padded = F.pad(kv, (0, 0, pad_len, 0))
+
+        k_windows = k_exp_padded.unfold(1, S, 1)           
+        kv_windows = kv_padded.unfold(1, S, 1)           
+
+        w = torch.clamp(self.pos_bias, -15, 15)           
+        w_exp = torch.exp(w).view(1, 1, S, 1)              
         
-        if mask is not None:
-            mask = mask.squeeze(1)  # (B, T, T)
-            mask_padded = torch.nn.functional.pad(mask, (0, 0, S - 1, 0))
-            mask_windows = mask_padded.unfold(1, S, 1)
-            mask_windows = mask_windows[..., torch.arange(T, device=x.device)]
-            mask_windows = mask_windows.unsqueeze(-1)
+        num = torch.sum(w_exp * kv_windows, dim=2)         
+        den = torch.sum(w_exp * k_windows, dim=2) + 1e-6   
 
-            w_exp = w_exp * mask_windows
-            
-
-        num = torch.einsum('bti,bid->btd', w_exp, kv)
-        den = torch.einsum('bti,bid->btd', w_exp, k_exp) + 1e-6
-
-        # 6. Output
         out = q * (num / den)
         out = self.dropout(out)
 
         return self.Wo(out)
-    
+        
 class InputEmbedding(nn.Module):
     def __init__(self, d_model: int, vocab_size: int, ):
         super().__init__()
