@@ -56,20 +56,19 @@ class StandardAttention(nn.Module):
             x = layer(x, mask)
         return self.norm(x)
 
-class AFTFull(nn.Module):
-    def __init__(self, d_model: int, max_seq_len: int = 2048, dropout: float = 0.0, window_size = 32, **kwargs):
+class AFTLocal(nn.Module):
+    def __init__(self, d_model: int, seq_len: int = 2048, dropout: float = 0.0, window_size = 32, **kwargs):
         super().__init__()
         self.d_model = d_model
-        self.max_seq_len = max_seq_len
+        self.max_seq_len = seq_len
         
         self.Wq = nn.Linear(d_model, d_model)
         self.Wk = nn.Linear(d_model, d_model)
         self.Wv = nn.Linear(d_model, d_model)
         self.Wo = nn.Linear(d_model, d_model)
         
-        self.window_size = self.window_size
+        self.window_size = window_size
 
-        # Learned pairwise position biases (T_max, T_max)
         self.pos_bias = nn.Parameter(torch.zeros(window_size))
         self.dropout = nn.Dropout(dropout)
 
@@ -90,18 +89,19 @@ class AFTFull(nn.Module):
         k_exp_padded = F.pad(k_exp, (0, 0, pad_len, 0))    
         kv_padded = F.pad(kv, (0, 0, pad_len, 0))
 
+        # Shapes become (Batch, Time, Dim, S)
         k_windows = k_exp_padded.unfold(1, S, 1)           
         kv_windows = kv_padded.unfold(1, S, 1)           
 
         w = torch.clamp(self.pos_bias, -15, 15)           
-        w_exp = torch.exp(w).view(1, 1, S, 1)              
         
-        num = torch.sum(w_exp * kv_windows, dim=2)         
-        den = torch.sum(w_exp * k_windows, dim=2) + 1e-6   
+        w_exp = torch.exp(w).view(1, 1, 1, S)              
+        
+        num = torch.sum(w_exp * kv_windows, dim=-1)        
+        den = torch.sum(w_exp * k_windows, dim=-1) + 1e-6   
 
         out = q * (num / den)
         out = self.dropout(out)
-
         return self.Wo(out)
         
 class InputEmbedding(nn.Module):

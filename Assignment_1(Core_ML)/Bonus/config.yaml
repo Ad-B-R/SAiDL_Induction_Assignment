@@ -2,7 +2,7 @@ dataset: "wikitext-2"
 seq_len: 256
 batch_size: 4
 lr: 3e-4
-epochs: 2
+epochs: 5
 
 vocab_size: 50257  
 d_model: 256
@@ -10,3 +10,7 @@ h: 8
 d_ff: 1024         
 num_layers: 4      
 dropout: 0.1   
+
+num_workers: 4
+window_size: 32
+pin_memory: True

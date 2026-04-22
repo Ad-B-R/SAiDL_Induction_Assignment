@@ -19,7 +19,7 @@ tokenizer = model.tokenizer
 # Hook point (layer 3 input)
 hook_point = "blocks.2.hook_resid_pre"
 
-resume_step = 40000
+resume_step = 90000
 dataset = load_dataset("openwebtext", split="train", streaming=True)
 skip_dataset = dataset.skip(resume_step)
 

@@ -56,10 +56,10 @@ class StandardAttention(nn.Module):
         return self.norm(x)
 
 class AFTFull(nn.Module):
-    def __init__(self, d_model: int, max_seq_len: int = 2048, dropout: float = 0.0, **kwargs):
+    def __init__(self, d_model: int, seq_len: int = 2048, dropout: float = 0.0, **kwargs):
         super().__init__()
         self.d_model = d_model
-        self.max_seq_len = max_seq_len
+        self.max_seq_len = seq_len
         
         self.Wq = nn.Linear(d_model, d_model)
         self.Wk = nn.Linear(d_model, d_model)
@@ -67,7 +67,7 @@ class AFTFull(nn.Module):
         self.Wo = nn.Linear(d_model, d_model)
         
         # Learned pairwise position biases (T_max, T_max)
-        self.pos_bias = nn.Parameter(torch.zeros(max_seq_len, max_seq_len))
+        self.pos_bias = nn.Parameter(torch.zeros(seq_len, seq_len))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, mask=None):
@@ -83,18 +83,15 @@ class AFTFull(nn.Module):
         # 2. Positional bias
         w = self.pos_bias[:T, :T]                      
 
-        w = torch.clamp(w, -10, 10)
-        w_exp = torch.exp(w)
-        
         if mask is not None:
-            mask = mask.squeeze(1)  # (B, T, T)
-            mask_padded = torch.nn.functional.pad(mask, (0, 0, S - 1, 0))
-            mask_windows = mask_padded.unfold(1, S, 1)
-            mask_windows = mask_windows[..., torch.arange(T, device=x.device)]
-            mask_windows = mask_windows.unsqueeze(-1)
+            mask = mask.squeeze(1)                     
+            w = w.unsqueeze(0).expand(B, T, T)
+            w = w.masked_fill(mask == 0, float('-inf'))
+        else:
+            w = w.unsqueeze(0).expand(B, T, T)
 
-            w_exp = w_exp * mask_windows
-            
+        w = torch.clamp(w, -10, 10)
+        w_exp = torch.exp(w)                           
 
         num = torch.einsum('bti,bid->btd', w_exp, kv)
         den = torch.einsum('bti,bid->btd', w_exp, k_exp) + 1e-6

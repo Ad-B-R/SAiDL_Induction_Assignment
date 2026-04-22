@@ -124,6 +124,7 @@ for m_bottleneck in m:
         Z_res = Zc - Z_proj
 
         return Z_proj, Z_res
+    
     def get_range(x, p=0.999):
         high = torch.quantile(x, p)
         low = torch.quantile(x, 1 - p)
@@ -140,10 +141,16 @@ for m_bottleneck in m:
         # 4. Quantize Residual
         proj_min, proj_max = get_range(Z_proj)
         res_min, res_max = get_range(Z_res)
-        
-        Z_proj_q = quantize_gen(proj_min, proj_max, bits_high, Z_proj)
-        
-        Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
+        if bits_high == 16:
+            Z_proj_q = Z_proj
+        else:
+            Z_proj_q = quantize_gen(proj_min, proj_max, bits_high, Z_proj)
+
+
+        if bits_low==16:
+            Z_res_q = Z_res
+        else:
+            Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
 
         # 5. Recombine
         Z_hat = Z_proj_q + Z_res_q + mean
@@ -170,16 +177,15 @@ for m_bottleneck in m:
         Z_c = Z - Z.mean(dim=0, keepdim=True)
         Z_c_hat = Z_hat - Z_hat.mean(dim=0, keepdim=True)
 
-        U, S, Vh = torch.linalg.svd(Z_c, full_matrices=False)
-        U_hat, S_hat, Vh_hat = torch.linalg.svd(Z_c_hat, full_matrices=False)
+        U, S, V = torch.svd_lowrank(Z_c, q=k)
+        U_hat, S_hat, V_hat = torch.svd_lowrank(Z_c_hat, q=k)
 
-        Uk = Vh[:k].T
-        Uk_hat = Vh_hat[:k].T
+        Uk = V[:, :k]
+        Uk_hat = V_hat[:, :k]
 
         cos_thetas = torch.linalg.svdvals(Uk.T @ Uk_hat)
         angles = torch.acos(torch.clamp(cos_thetas, -1, 1)) * (180 / math.pi)
 
-        # SDS
         E = Z - Z_hat
         sds = (torch.norm(E @ Uk)**2 / torch.norm(Z @ Uk)**2).item()
 
@@ -294,24 +300,29 @@ for m_bottleneck in m:
         k_val = int(F*k)
         importance = normalize(jacobian_imp) + normalize(fisher_imp)
         Z_weighted = Z_flat * importance
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
 
         U, S, V = torch.svd(Z_weighted)
         Vk_global = V[:, :k_val]
     
         return Vk_global
     
-    Vk_global = compute_importance(k=0.02)
+    Vk_global = compute_importance(k=0.2)
     
-    bit_configs = [4, 2, None]
+    bit_configs = [16, 8, 4, 2, None]
 
-    modes = ["per_tensor", "subspace"]
+    modes = ["subspace", "per_tensor"]
     umap_data = {
         "Baseline": [],
         'per_tensor': {
+        "16-bit_per_tensor": [],
+        "8-bit_per_tensor": [],
         "4-bit_per_tensor": [],
         "2-bit_per_tensor": []
         },
         'subspace': {
+        "16-bit_subspace": [],
+        "8-bit_subspace": [],
         "4-bit_subspace": [],
         "2-bit_subspace": []
         }
@@ -331,14 +342,24 @@ for m_bottleneck in m:
                 return acts  # baseline
 
             if mode == "per_tensor":
-                Z_hat = quantize_gen(global_min, global_max, bits, Z)
+                Z_flat = Z.view(-1, Z.size(-1))
+
+                Z_hat_flat = subspace_quantize(
+                    Z_flat, Vk_global, mean,
+                    bits_high=bits,
+                    bits_low=bits,
+                    min_val=global_min,
+                    max_val=global_max
+                )
+
+                Z_hat = Z_hat_flat.view_as(Z)
 
             elif mode == "subspace":
                 Z_flat = Z.view(-1, Z.size(-1))
 
                 Z_hat_flat = subspace_quantize(
                     Z_flat, Vk_global, mean,
-                    bits_high=8,
+                    bits_high=16,
                     bits_low=bits,
                     min_val=global_min,
                     max_val=global_max
@@ -374,11 +395,15 @@ for m_bottleneck in m:
 
         for bits in bit_configs:
             acts_samples = []
-            max_samples = 5
-            label = f"{bits}-bit" if bits else "Baseline"
+            max_samples = 10
+            if bits is not None:
+                label = f"{bits}-bit" if bits!=16 else "Baseline_16_bit"
+            else:
+                label = "Standard_Pass_baseline"
+
             wandb.init(
             project="sae-quantization-pt3",
-            name=f"{mode}_{label}_analysis",
+            name=f"{mode}_{label}_analysis_{m_bottleneck}",
             reinit=True
             )
             print(f"\nEvaluating: {label}")
@@ -408,20 +433,26 @@ for m_bottleneck in m:
                         
                             Z_hat_flat = subspace_quantize(
                                 Z_flat, Vk_global, mean_global,
-                                bits_high=8,
+                                bits_high=16,
                                 bits_low=bits,
                                 min_val=global_min,
                                 max_val=global_max
                             )
 
                             Z_hat_batch = Z_hat_flat.view_as(Z_batch)
+                        
                         elif mode == "per_tensor":
-                            Z_hat_batch = quantize_gen(
-                            min=global_min,
-                            max=global_max,
-                            bit=bits,
-                            tensor=Z_batch
-                        )
+                            Z_flat = Z_batch.view(-1, Z_batch.size(-1))
+                        
+                            Z_hat_flat = subspace_quantize(
+                                Z_flat, Vk_global, mean_global,
+                                bits_high=bits,
+                                bits_low=bits,
+                                min_val=global_min,
+                                max_val=global_max
+                            )
+
+                            Z_hat_batch = Z_hat_flat.view_as(Z_batch)                        
                     else:
                         Z_hat_batch = Z_batch    
 
@@ -467,7 +498,7 @@ for m_bottleneck in m:
 
             ppl = compute_ppl_with_hook(model, eval_batches, hook_fn)
 
-            if bits is not None: print(f"{mode*2} | {bits}-bit → PPL: {ppl:.2f}")
+            if bits is not None: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
             else: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
             spectral = spectral_analysis(Z, Z_hat)
 
@@ -500,6 +531,7 @@ for m_bottleneck in m:
             sparsity_delta = s_after - s_before
                 
             wandb.log({
+                "bit_high": 16,
                 "k_value": k,
                 "Perplexity": ppl,
                 "jacobian_mean": jacobian.mean().item(),
@@ -523,4 +555,4 @@ for m_bottleneck in m:
             print(f"\nCausal Alignment (Damage vs Perplexity Impact):")
 
     print("<------------------- ROBUST QUANTIZATION FINISHED --------------------------->")
-    print("<------------------- SUCCESS --------------------------->")
+    print("<------------------- SUCCESS --------------------------->")  

@@ -7,38 +7,105 @@ from data import create_dataloader
 import wandb
 import hydra
 import time
-import AFT_full, AFT_local, AFT_simple
+import AFT_full, AFT_local, AFT_simple, AFT_conv
 import os
 from omegaconf import DictConfig, OmegaConf
+
 import matplotlib.pyplot as plt
 
+print(f" CUDA: {'cuda' if torch.cuda.is_available() else 'cpu'}")
+
 class GPT(nn.Module):
-    def __init__(self, vocab_size:int, d_model:int, seq_len: int, h:int, num_layers:int, d_ff: int, dropout:float):
+    def __init__(
+        self,
+        vocab_size,
+        d_model,
+        seq_len,
+        num_layers,
+        d_ff,
+        n_heads,
+        dropout,
+        attention_type="full",
+        window_size=32
+    ):
         super().__init__()
-        self.embedding = model.InputEmbedding(d_model=d_model, vocab_size=vocab_size)
-        self.pos_embed = model.PositionalEncoding(d_model=d_model, seq_len=seq_len, dropout=dropout)
+        if attention_type=="full":
+            attn_cls = AFT_full.AFTFull
+            model = AFT_full
+
+        elif attention_type=="local":
+            attn_cls = AFT_local.AFTLocal
+            model = AFT_local
+
+        elif attention_type=="simple":
+            attn_cls = AFT_simple.AFTSimple
+            model = AFT_simple
+        
+        elif attention_type=="conv":
+            attn_cls = AFT_conv.AFTConv
+            model = AFT_conv
+
+        else:
+            raise ValueError(attention_type)
+        
+        self.embedding = model.InputEmbedding(
+            d_model=d_model,
+            vocab_size=vocab_size
+        )
+
+        self.pos_embed = model.PositionalEncoding(
+            d_model=d_model,
+            seq_len=seq_len,
+            dropout=dropout
+        )
+
+
         layers = nn.ModuleList([
             model.AttentionBlock(
-                features=d_model, 
-                
-                self_attention_block=model.MultiHeadAttention(d_model=d_model, h=h, dropout=dropout,pos_encoding_fn=self.pos_embed),
+                features=d_model,
 
-                feed_forward_block=model.FeedForwardNetwork(d_model=d_model, d_ff=d_ff, dropout=dropout),
+                self_attention_block=attn_cls(
+                    d_model=d_model,
+                    seq_len=seq_len,
+                    window_size=window_size,
+                    dropout=dropout,
+                    n_heads=n_heads,
+
+                ),
+
+                feed_forward_block=model.FeedForwardNetwork(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    dropout=dropout
+                ),
 
                 dropout=dropout
-                ) for _ in range(num_layers)
-        ])
-        self.transformer = model.StandardAttention(features=d_model, layers=layers)
+            )
 
-        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+            for _ in range(num_layers)
+        ])
+
+        self.transformer = model.StandardAttention(
+            features=d_model,
+            layers=layers
+        )
+
+        self.lm_head = nn.Linear(
+            d_model,
+            vocab_size,
+            bias=False
+        )
 
     def forward(self, x):
+
         x = self.embedding(x)
+
+        x = self.pos_embed(x)
 
         x = self.transformer(x, mask=None)
 
         return self.lm_head(x)
-    
+        
 config_dir = os.path.dirname(os.path.abspath(__file__))
 
 @torch.no_grad()
@@ -75,8 +142,11 @@ def train(cfg: DictConfig):
     base_seq_len = cfg.seq_len
     base_batch_size = cfg.batch_size
 
-    attention_types = ["interleaved","subset"]
-    multipliers = [2]
+    attention_types = ["local", "simple", "conv"
+                    #    , "full"
+                       ]
+    multipliers = [2] # seq_len multi
+    
     for attn in attention_types:
         for mult in multipliers:
             cfg.attention = attn
@@ -87,7 +157,7 @@ def train(cfg: DictConfig):
                 torch.cuda.reset_peak_memory_stats(device)
 
             wandb.init(
-                project="transformer-master-ablation", 
+                project="aft-master-ablation", 
                 name=f"{attn}_seq_{cfg.seq_len}_Standard", 
                 config=OmegaConf.to_container(cfg, resolve=True),
                 reinit=True 
@@ -95,7 +165,9 @@ def train(cfg: DictConfig):
             
             train_loader = create_dataloader(cfg, split="train", shuffle=True)
             val_loader = create_dataloader(cfg, split="validation", shuffle=False)
-            model = GPT(cfg.vocab_size, cfg.d_model, cfg.seq_len, cfg.h, cfg.num_layers, cfg.d_ff, cfg.dropout).to(device)
+            model = GPT(vocab_size= cfg.vocab_size, d_model=cfg.d_model, window_size=cfg.window_size, 
+                        seq_len=cfg.seq_len, n_heads=cfg.h, num_layers=cfg.num_layers, 
+                        d_ff=cfg.d_ff, dropout=cfg.dropout, attention_type=attn).to(device)
             optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr)
             loss_fn = nn.CrossEntropyLoss()
             scaler = torch.amp.GradScaler("cuda")

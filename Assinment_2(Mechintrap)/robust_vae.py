@@ -1,20 +1,5 @@
-from datasets import load_dataset
 import huggingface_hub
-import huggingface_hub
-if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
-    def dummy(*args, **kwargs):
-        return None
-    huggingface_hub.split_torch_state_dict_into_shards = dummy
-import sys
-import types
-
-for name in list(sys.modules.keys()):
-    if "transformers.models" in name and any(x in name for x in ["bert", "hubert", "wav2vec"]):
-        sys.modules[name] = types.ModuleType(name)
-
-# 3. Now the scanner will pass BERT safely, and this will work:
 from transformer_lens import HookedTransformer
-from scipy.stats import spearmanr
 from datasets import load_dataset
 import torch
 import torch.nn as nn
@@ -35,10 +20,9 @@ model = model.to(device)
 model.eval()
 
 tokenizer = model.tokenizer
-
+k = 0
 m = [512,1024]
 for m_bottleneck in m:
-    
     class VAE(nn.Module):
         def __init__(self, input_dim=768, latent_dim=1024):
             super().__init__()
@@ -96,22 +80,28 @@ for m_bottleneck in m:
                     batches_yielded += 1
                     if batches_yielded >= num_batches:
                         return # Stop the generator once we hit our eval limit
-                    
-    def compute_jacobian_norms(sae_model, acts):
+                        
+    def compute_jacobian_norms(vae_model, acts):
         acts = acts.clone().detach().requires_grad_(True)
-        _, feats, _, _ = sae_model(acts)
 
-        D = feats.size(-1)
-        J = torch.zeros(D, device=acts.device)
+        B, T, D = acts.shape
+        flat = acts.view(-1, D)
 
-        for i in range(D):
-            grad = torch.autograd.grad(
-                feats[..., i].sum(), acts,
-                retain_graph=True
-            )[0]
-            J[i] = grad.norm()
+        _, Z, _, _ = vae_model(flat)  # [N, F]
 
-        return J
+        grad_outputs = torch.ones_like(Z)
+
+        grads = torch.autograd.grad(
+            outputs=Z,
+            inputs=acts,
+            grad_outputs=grad_outputs,
+            retain_graph=False
+        )[0]
+
+        # map to feature importance (approx)
+        importance = Z.abs().mean(dim=0)
+
+        return importance
 
     def compute_fisher(Z):
         return (Z ** 2).mean(dim=0)
@@ -141,19 +131,35 @@ for m_bottleneck in m:
         Z_res = Zc - Z_proj
 
         return Z_proj, Z_res
-
+    
+    def get_range(x, p=0.999):
+        high = torch.quantile(x, p)
+        low = torch.quantile(x, 1 - p)
+        return low, high
+ 
     def subspace_quantize(Z, Vk, mean, bits_high=8, bits_low=2,
-                        min_val=None, max_val=None):
+                          min_val=None, max_val=None):
 
+        # 2. Decompose
         Z_proj, Z_res = decompose_subspace(Z, Vk, mean)
 
-        Z_proj_q = quantize_gen(min_val, max_val, bits_high, Z_proj)
-        res_min = Z_res.min()
-        res_max = Z_res.max()
+        # 4. Quantize Residual
+        proj_min, proj_max = get_range(Z_proj)
+        res_min, res_max = get_range(Z_res)
+        if bits_high == 16:
+            Z_proj_q = Z_proj
+        else:
+            Z_proj_q = quantize_gen(proj_min, proj_max, bits_high, Z_proj)
 
-        Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
 
+        if bits_low==16:
+            Z_res_q = Z_res
+        else:
+            Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
+
+        # 5. Recombine
         Z_hat = Z_proj_q + Z_res_q + mean
+
 
         return Z_hat
 
@@ -175,16 +181,15 @@ for m_bottleneck in m:
         Z_c = Z - Z.mean(dim=0, keepdim=True)
         Z_c_hat = Z_hat - Z_hat.mean(dim=0, keepdim=True)
 
-        U, S, Vh = torch.linalg.svd(Z_c, full_matrices=False)
-        U_hat, S_hat, Vh_hat = torch.linalg.svd(Z_c_hat, full_matrices=False)
+        U, S, V = torch.svd_lowrank(Z_c, q=k)
+        U_hat, S_hat, V_hat = torch.svd_lowrank(Z_c_hat, q=k)
 
-        Uk = Vh[:k].T
-        Uk_hat = Vh_hat[:k].T
+        Uk = V[:, :k]
+        Uk_hat = V_hat[:, :k]
 
         cos_thetas = torch.linalg.svdvals(Uk.T @ Uk_hat)
         angles = torch.acos(torch.clamp(cos_thetas, -1, 1)) * (180 / math.pi)
 
-        # SDS
         E = Z - Z_hat
         sds = (torch.norm(E @ Uk)**2 / torch.norm(Z @ Uk)**2).item()
 
@@ -206,7 +211,7 @@ for m_bottleneck in m:
 
                 _, cache = model.run_with_cache(batch)
                 acts = cache["blocks.2.hook_resid_pre"]
-                _, Z, _, _ = sae_model(acts)
+                _, Z, _, _ = vae_model(acts)
 
                 Z_calib_all.append(Z.view(-1, Z.size(-1)))
 
@@ -257,17 +262,71 @@ for m_bottleneck in m:
                 feature_max = torch.maximum(feature_max, batch_max)
 
     print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
+    def normalize(x):
+        return (x - x.mean()) / (x.std() + 1e-8)    
+  
+    def compute_importance(k):
+        all_Z = []
+        acts_samples = []
+        max_samples = 5  
+        with torch.no_grad():
+            for batch in eval_batches:
+                _, cache = model.run_with_cache(batch)
+                acts = cache["blocks.2.hook_resid_pre"]
+                if len(acts_samples) < max_samples:
+                    acts_samples.append(acts.detach())
 
+                B, T, D = acts.shape
+                flat = acts.view(-1, D)
 
-    bit_configs = [4, 2, None]
-    modes = ["per_tensor", "subspace"]
+                _, Z_flat, _, _ = vae_model(flat)
+                Z = Z_flat.view(B, T, -1)
+
+                all_Z.append(Z)
+
+        Z = torch.cat(all_Z, dim=0)
+
+        Z_flat = Z.view(-1, Z.size(-1))
+        jacobian_imp = None
+
+        for acts in acts_samples:
+            J = compute_jacobian_norms(vae_model, acts)
+
+            if jacobian_imp is None:
+                jacobian_imp = J
+            else:
+                jacobian_imp += J
+
+        jacobian_imp /= len(acts_samples)
+        fisher_imp   = compute_fisher(Z_flat)
+
+        F = Z_flat.size(-1)
+        k_val = int(F*k)
+        importance = normalize(jacobian_imp) + normalize(fisher_imp)
+        Z_weighted = Z_flat * importance
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
+
+        U, S, V = torch.svd(Z_weighted)
+        Vk_global = V[:, :k_val]
+    
+        return Vk_global
+    
+    Vk_global = compute_importance(k=0.2)
+    
+    bit_configs = [16, 8, 4, 2, None]
+
+    modes = ["subspace", "per_tensor"]
     umap_data = {
         "Baseline": [],
         'per_tensor': {
+        "16-bit_per_tensor": [],
+        "8-bit_per_tensor": [],
         "4-bit_per_tensor": [],
         "2-bit_per_tensor": []
         },
         'subspace': {
+        "16-bit_subspace": [],
+        "8-bit_subspace": [],
         "4-bit_subspace": [],
         "2-bit_subspace": []
         }
@@ -275,26 +334,36 @@ for m_bottleneck in m:
 
     results = {}
     def get_quant_hook(mode, bits,
-                    sae_model,
+                    vae_model,
                     global_min, global_max,
                     Vk=None, mean=None):
 
         def hook_fn(acts, hook):
             # SAE forward
-            _, Z, _, _ = sae_model(acts)
+            _, Z, _, _ = vae_model(acts)
 
             if bits is None:
                 return acts  # baseline
 
             if mode == "per_tensor":
-                Z_hat = quantize_gen(global_min, global_max, bits, Z)
+                Z_flat = Z.view(-1, Z.size(-1))
+
+                Z_hat_flat = subspace_quantize(
+                    Z_flat, Vk_global, mean,
+                    bits_high=bits,
+                    bits_low=bits,
+                    min_val=global_min,
+                    max_val=global_max
+                )
+
+                Z_hat = Z_hat_flat.view_as(Z)
 
             elif mode == "subspace":
                 Z_flat = Z.view(-1, Z.size(-1))
 
                 Z_hat_flat = subspace_quantize(
-                    Z_flat, Vk, mean,
-                    bits_high=8,
+                    Z_flat, Vk_global, mean,
+                    bits_high=16,
                     bits_low=bits,
                     min_val=global_min,
                     max_val=global_max
@@ -305,7 +374,7 @@ for m_bottleneck in m:
             else:
                 raise ValueError(mode)
 
-            recon = sae_model.decoder(Z_hat)
+            recon = vae_model.decoder(Z_hat)
             return recon
 
         return hook_fn
@@ -330,14 +399,17 @@ for m_bottleneck in m:
 
         for bits in bit_configs:
             acts_samples = []
-            max_samples = 5
-            label = f"{bits}-bit" if bits else "Baseline"
+            max_samples = 10
+            if bits is not None:
+                label = f"{bits}-bit" if bits!=16 else "Baseline_16_bit"
+            else:
+                label = "Standard_Pass_baseline"
+
             wandb.init(
-            project="sae-quantization-pt3",
-            name=f"{mode}_{label}_analysis",
+            project="vae-quantization",
+            name=f"{mode}_{label}_analysis_{m_bottleneck}",
             reinit=True
             )
-            label = f"{bits}-bit" if bits else "Baseline"
             print(f"\nEvaluating: {label}")
             Z_all = []
             Z_hat_all = []
@@ -350,9 +422,11 @@ for m_bottleneck in m:
 
                     _, cache = model.run_with_cache(batch)
                     clean_acts = cache["blocks.2.hook_resid_pre"]
-                    _, sparse_feats, _, _ = vae_model(clean_acts)
+                    B, T, D = clean_acts.shape
+                    flat = clean_acts.view(-1, D)
 
-                    Z_batch = sparse_feats
+                    _, sparse_feats_flat, _, _ = vae_model(flat)
+                    Z_batch = sparse_feats_flat.view(B, T, -1)
                     if len(acts_samples) < max_samples:
                         acts_samples.append(clean_acts[:1].detach())    
                     
@@ -360,23 +434,29 @@ for m_bottleneck in m:
                         if mode == "subspace":
                         # Flatten for SVD
                             Z_flat = Z_batch.view(-1, Z_batch.size(-1))
-
+                        
                             Z_hat_flat = subspace_quantize(
                                 Z_flat, Vk_global, mean_global,
-                                bits_high=8,
+                                bits_high=16,
                                 bits_low=bits,
                                 min_val=global_min,
                                 max_val=global_max
                             )
 
                             Z_hat_batch = Z_hat_flat.view_as(Z_batch)
+                        
                         elif mode == "per_tensor":
-                            Z_hat_batch = quantize_gen(
-                            min=global_min,
-                            max=global_max,
-                            bit=bits,
-                            tensor=Z_batch
-                        )
+                            Z_flat = Z_batch.view(-1, Z_batch.size(-1))
+                        
+                            Z_hat_flat = subspace_quantize(
+                                Z_flat, Vk_global, mean_global,
+                                bits_high=bits,
+                                bits_low=bits,
+                                min_val=global_min,
+                                max_val=global_max
+                            )
+
+                            Z_hat_batch = Z_hat_flat.view_as(Z_batch)                        
                     else:
                         Z_hat_batch = Z_batch    
 
@@ -413,18 +493,17 @@ for m_bottleneck in m:
             hook_fn = get_quant_hook(
                 mode=mode,
                 bits=bits,
-                sae_model=vae_model,
+                vae_model=vae_model,
                 global_min=global_min,
                 global_max=global_max,
-                feature_min=feature_min,
-                feature_max=feature_max,
                 Vk=Vk_global,
                 mean=mean_global
             )
 
             ppl = compute_ppl_with_hook(model, eval_batches, hook_fn)
 
-            print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
+            if bits is not None: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
+            else: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
             spectral = spectral_analysis(Z, Z_hat)
 
             fisher = compute_fisher(Z)
@@ -447,7 +526,8 @@ for m_bottleneck in m:
             max_angle = angles.max().item()
 
             def sparsity(x):
-                return (x.abs() < 1e-3).float().mean().item()
+                return (x == 0).float().mean().item()
+
             s_before = sparsity(Z)
             s_after = sparsity(Z_hat)
 
@@ -455,6 +535,8 @@ for m_bottleneck in m:
             sparsity_delta = s_after - s_before
                 
             wandb.log({
+                "bit_high": 16,
+                "k_value": k,
                 "Perplexity": ppl,
                 "jacobian_mean": jacobian.mean().item(),
                 "fisher_mean": fisher.mean().item(),
@@ -477,4 +559,4 @@ for m_bottleneck in m:
             print(f"\nCausal Alignment (Damage vs Perplexity Impact):")
 
     print("<------------------- ROBUST QUANTIZATION FINISHED --------------------------->")
-    print("<------------------- SUCCESS --------------------------->")
+    print("<------------------- SUCCESS --------------------------->")  

@@ -53,8 +53,9 @@ class StandardAttention(nn.Module):
         for layer in self.layers:
             x = layer(x, mask)
         return self.norm(x)
+    
 class AFTSimple(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.0):
+    def __init__(self, d_model: int, dropout: float = 0.0, **kwargs):
         super().__init__()
 
         self.d_model = d_model

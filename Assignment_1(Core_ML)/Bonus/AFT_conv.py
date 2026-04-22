@@ -56,7 +56,7 @@ class StandardAttention(nn.Module):
         return self.norm(x)
     
 class AFTConv(nn.Module):
-    def __init__(self, d_model, n_heads, window_size, dropout=0.0):
+    def __init__(self, d_model, n_heads, window_size, dropout=0.0, **kwargs):
         super().__init__()
 
         assert d_model % n_heads == 0
@@ -111,11 +111,11 @@ class AFTConv(nn.Module):
         w_hat = (
             self.gamma.unsqueeze(1) * w_norm +
             self.beta.unsqueeze(1)
-        )                                            # (H, S)
+        )                                           
 
-        kernel = torch.exp(torch.clamp(w_hat, -15, 15)) - 1   # (H, S)
+        kernel = torch.exp(torch.clamp(w_hat, -15, 15)) - 1  
 
-        k_exp_ = k_exp.permute(0, 2, 1).contiguous()        # (B, H, T)
+        k_exp_ = k_exp.permute(0, 2, 1).contiguous()       
         kv_ = (k_exp.unsqueeze(-1) * v).permute(0, 2, 3, 1) # (B, H, Dh, T)
 
         k_exp_ = k_exp_.reshape(B * H, 1, T)
