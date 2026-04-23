@@ -143,7 +143,7 @@ def train(cfg: DictConfig):
     base_batch_size = cfg.batch_size
 
     attention_types = ["conv"
-                    # , "local", "simple", "full"
+                    , "local", "simple", "full"
                        ]
     multipliers = [2] # seq_len multi
     
