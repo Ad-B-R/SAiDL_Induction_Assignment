@@ -79,7 +79,7 @@ class AFTConv(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, mask):
         B, T, D = x.shape
         H = self.n_heads
         Dh = self.d_head
@@ -122,13 +122,23 @@ class AFTConv(nn.Module):
         kv_ = kv_.reshape(B * H * Dh, 1, T)
 
         # expand kernels
-        kernel_k = kernel.repeat(B, 1).view(B * H, 1, S)
-        kernel_v = kernel.repeat(B * Dh, 1).view(B * H * Dh, 1, S)
-
-        k_local = F.conv1d(k_exp_, kernel_k, padding=S-1, groups=B*H)[:, :, :T]
+        kernel_k = kernel[0].view(1,1,S)
+        kernel_v = kernel[0].view(1,1,S)
+        
+        k_local = F.conv1d(
+            k_exp_,
+            kernel_k,
+            padding=S-1,
+            groups=1
+        )[:, :, :T]
         k_local = k_local.view(B, H, T).permute(0, 2, 1)   # (B, T, H)
 
-        kv_local = F.conv1d(kv_, kernel_v, padding=S-1, groups=B*H*Dh)[:, :, :T]
+        kv_local = F.conv1d(
+            kv_,
+            kernel_v,
+            padding=S-1,
+            groups=1
+        )[:, :, :T]
         kv_local = kv_local.view(B, H, Dh, T).permute(0, 3, 1, 2)  # (B, T, H, Dh)
 
         num = kv_local + kv_global

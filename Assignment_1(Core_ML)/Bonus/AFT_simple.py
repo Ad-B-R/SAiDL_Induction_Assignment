@@ -67,7 +67,7 @@ class AFTSimple(nn.Module):
 
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x):
+    def forward(self, x, mask):
         B, T, D = x.shape
 
         q = torch.sigmoid(self.Wq(x))                 
