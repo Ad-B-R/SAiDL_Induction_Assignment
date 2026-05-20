@@ -24,3 +24,4 @@ class RelativePositionBias(nn.Module):
         # (1, h, seq_len, seq_len)
         return bias.unsqueeze(0)
     
+    

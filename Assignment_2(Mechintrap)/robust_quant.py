@@ -73,46 +73,54 @@ for m_bottleneck in m:
                     batches_yielded += 1
                     if batches_yielded >= num_batches:
                         return # Stop the generator once we hit our eval limit
-                        
+                            
     def compute_jacobian_norms(sae_model, acts):
         acts = acts.clone().detach().requires_grad_(True)
-
         B, T, D = acts.shape
         flat = acts.view(-1, D)
-
+        
         _, Z = sae_model(flat)  # [N, F]
-
-        grad_outputs = torch.ones_like(Z)
-
-        grads = torch.autograd.grad(
-            outputs=Z,
-            inputs=acts,
-            grad_outputs=grad_outputs,
-            retain_graph=False
-        )[0]
-
-        # map to feature importance (approx)
-        importance = Z.abs().mean(dim=0)
-
+        
+        # For each feature f, compute ||dZ_f / d_acts||
+        # This measures: how sensitive is feature f to its input?
+        F = Z.size(-1)
+        importance = torch.zeros(F, device=Z.device)
+        
+        for f in range(F):
+            grad = torch.autograd.grad(
+                outputs=Z[:, f].sum(),
+                inputs=acts,
+                retain_graph=(f < F - 1),
+            )[0]
+            importance[f] = grad.norm().item()
+        
         return importance
-
     def compute_fisher(Z):
         return (Z ** 2).mean(dim=0)
-
+    
     def quantize_gen(min, max, bit, tensor):
-        q_max = int(2**bit - 1)
-        s = (max-min)/(q_max + 1e-9)
-        shift = tensor - min
-        q = torch.round(shift/(s + 1e-9))
-        q_clip = torch.clamp(q, 0, q_max)
-        de_quantize = (q_clip*s) + min
-        return de_quantize
 
-    def compute_subspace(Z, k=64):
+        if bit >= 16:
+            return tensor   # exact pass-through
+
+        qmax = 2**bit - 1
+
+        scale = (max-min)/qmax
+
+        q = torch.round(
+            (tensor-min)/(scale + 1e-12)
+        )
+
+        q = q.clamp(0,qmax)
+
+        return q*scale + min
+    
+    def compute_subspace(Z, k=256):
         Zc = Z - Z.mean(dim=0, keepdim=True)
         U, S, Vh = torch.linalg.svd(Zc, full_matrices=False)
 
         Vk = Vh[:k].T   # [D, k]
+        Vk, _ = torch.linalg.qr(Vk)
         mean = Z.mean(dim=0, keepdim=True)
 
         return Vk, mean
@@ -135,24 +143,24 @@ for m_bottleneck in m:
 
         sparsity_mask = (Z != 0.0).float()
 
-        # 2. Decompose
-        Z_proj, Z_res = decompose_subspace(Z, Vk, mean)
-
-        # 4. Quantize Residual
-        proj_min, proj_max = get_range(Z_proj)
-        res_min, res_max = get_range(Z_res)
+        Zc = Z-mean
+        C = Zc @ Vk  # Shape: [Batch, k]
+        
+        C_min, C_max = get_range(C) # MUST be per-channel for SVD
+        
         if bits_high == 16:
-            Z_proj_q = Z_proj
+            C_q = C
         else:
-            Z_proj_q = quantize_gen(proj_min, proj_max, bits_high, Z_proj)
-
-
-        if bits_low==16:
+            C_q = quantize_gen(C_min, C_max, bits_high, C)
+        Z_proj_q = C_q @ Vk.T
+        Z_res = Zc - (C @ Vk.T)
+        res_min, res_max = get_range(Z_res) 
+        
+        if bits_low == 16:
             Z_res_q = Z_res
         else:
             Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
 
-        # 5. Recombine
         Z_hat = Z_proj_q + Z_res_q + mean
 
         Z_hat = Z_hat * sparsity_mask
@@ -230,7 +238,7 @@ for m_bottleneck in m:
         sae_model,
         calib_batches,
         device,
-        k=64
+        k=256
     )
 
     with torch.no_grad():
@@ -264,7 +272,7 @@ for m_bottleneck in m:
     def compute_importance(k):
         all_Z = []
         acts_samples = []
-        max_samples = 5  
+        max_samples = 25
         with torch.no_grad():
             for batch in eval_batches:
                 _, cache = model.run_with_cache(batch)
@@ -303,13 +311,14 @@ for m_bottleneck in m:
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   
 
         U, S, V = torch.svd(Z_weighted)
+        V, _= torch.linalg.qr(V)
         Vk_global = V[:, :k_val]
     
         return Vk_global
     
-    Vk_global = compute_importance(k=0.2)
+    Vk_global = compute_importance(k=0.3)
     
-    bit_configs = [16, 8, 4, 2, None]
+    bit_configs = [16, 8, 6, 4, 2, None]
 
     modes = ["subspace", "per_tensor"]
     umap_data = {
@@ -317,12 +326,14 @@ for m_bottleneck in m:
         'per_tensor': {
         "16-bit_per_tensor": [],
         "8-bit_per_tensor": [],
+        "6-bit_per_tensor": [],
         "4-bit_per_tensor": [],
         "2-bit_per_tensor": []
         },
         'subspace': {
         "16-bit_subspace": [],
         "8-bit_subspace": [],
+        "6-bit_subspace": [],
         "4-bit_subspace": [],
         "2-bit_subspace": []
         }
@@ -342,18 +353,16 @@ for m_bottleneck in m:
                 return acts  # baseline
 
             if mode == "per_tensor":
-                Z_flat = Z.view(-1, Z.size(-1))
-
-                Z_hat_flat = subspace_quantize(
-                    Z_flat, Vk_global, mean,
-                    bits_high=bits,
-                    bits_low=bits,
-                    min_val=global_min,
-                    max_val=global_max
+                Z_hat = quantize_gen(
+                    min=global_min,
+                    max=global_max,
+                    bit=bits,
+                    tensor=Z
                 )
 
-                Z_hat = Z_hat_flat.view_as(Z)
-
+                # preserve exact sparsity
+                Z_hat = Z_hat * (Z != 0).float()
+                
             elif mode == "subspace":
                 Z_flat = Z.view(-1, Z.size(-1))
 
@@ -442,17 +451,7 @@ for m_bottleneck in m:
                             Z_hat_batch = Z_hat_flat.view_as(Z_batch)
                         
                         elif mode == "per_tensor":
-                            Z_flat = Z_batch.view(-1, Z_batch.size(-1))
-                        
-                            Z_hat_flat = subspace_quantize(
-                                Z_flat, Vk_global, mean_global,
-                                bits_high=bits,
-                                bits_low=bits,
-                                min_val=global_min,
-                                max_val=global_max
-                            )
-
-                            Z_hat_batch = Z_hat_flat.view_as(Z_batch)                        
+                            Z_hat_batch = quantize_gen(min=global_min, max=global_max, bit=bits, tensor=Z_batch)
                     else:
                         Z_hat_batch = Z_batch    
 
