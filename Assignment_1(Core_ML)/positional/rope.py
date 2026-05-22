@@ -7,12 +7,12 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-def apply_rope(q, k):
+def apply_rope(q, k, scale = 1):
     seq_len = q.shape[-2]
     head_dim = q.shape[-1]
     device = q.device
 
-    position = torch.arange(seq_len, device=device).unsqueeze(1) # Shape: (seq_len, 1)
+    position = torch.arange(seq_len, device=device).unsqueeze(1) * scale # Shape: (seq_len, 1)
     div_term = torch.exp(torch.arange(0, head_dim, 2, device=device) * -(math.log(10000.0) / head_dim))
     freqs = position * div_term  # Shape: (seq_len, head_dim / 2)
     

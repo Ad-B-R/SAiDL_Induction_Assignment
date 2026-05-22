@@ -73,28 +73,29 @@ for m_bottleneck in m:
                     batches_yielded += 1
                     if batches_yielded >= num_batches:
                         return # Stop the generator once we hit our eval limit
-                            
+                        
     def compute_jacobian_norms(sae_model, acts):
         acts = acts.clone().detach().requires_grad_(True)
+
         B, T, D = acts.shape
         flat = acts.view(-1, D)
-        
+
         _, Z = sae_model(flat)  # [N, F]
-        
-        # For each feature f, compute ||dZ_f / d_acts||
-        # This measures: how sensitive is feature f to its input?
-        F = Z.size(-1)
-        importance = torch.zeros(F, device=Z.device)
-        
-        for f in range(F):
-            grad = torch.autograd.grad(
-                outputs=Z[:, f].sum(),
-                inputs=acts,
-                retain_graph=(f < F - 1),
-            )[0]
-            importance[f] = grad.norm().item()
-        
+
+        grad_outputs = torch.ones_like(Z)
+
+        grads = torch.autograd.grad(
+            outputs=Z,
+            inputs=acts,
+            grad_outputs=grad_outputs,
+            retain_graph=False
+        )[0]
+
+        # map to feature importance (approx)
+        importance = Z.abs().mean(dim=0)
+
         return importance
+
     def compute_fisher(Z):
         return (Z ** 2).mean(dim=0)
     

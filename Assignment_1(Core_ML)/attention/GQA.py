@@ -39,7 +39,7 @@ class StandardAttention(nn.Module):
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_model: int, h:int, dropout:float, h_GQA: int,
-                 pos_encoding_fn=None, use_rope: bool = False, 
+                 pos_encoding_fn=None, use_rope: bool = False, rope_scale: float = 1,
                  rpe_fn = None, use_rpe: bool = False,
                  alibi_fn = None, use_alibi: bool = False, **kwargs):
         super().__init__()
@@ -72,6 +72,8 @@ class GroupedQueryAttention(nn.Module):
         # In case alibi is used
         self.use_alibi = use_alibi
         self.alibi_fn = alibi_fn
+
+        self.rope_scale = rope_scale
 
 
     @staticmethod
@@ -111,7 +113,7 @@ class GroupedQueryAttention(nn.Module):
         alibi_pos = None       
         if self.use_rope:
             # print("Successfully reached this fn")   
-            query, key = self.pos_encoding_fn(query, key)
+            query, key = self.pos_encoding_fn(query, key, self.rope_scale)
         elif self.use_rpe:
             seq_len = query.shape[-2]
             rpe_bias = self.rpe_fn(seq_len, query.device)    
