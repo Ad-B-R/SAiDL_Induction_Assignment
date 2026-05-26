@@ -399,7 +399,29 @@ for m_bottleneck in m:
                 total_loss += loss.item()
 
         return math.exp(total_loss / len(eval_batches))
+    def clean_sae_hook(acts, hook):
+        B, T, D = acts.shape
+        flat = acts.view(-1, D)
+        _, Z = sae_model(flat)
+        recon = sae_model.decoder(Z)
+        return recon.view(B, T, D)
 
+    def identity_hook(acts, hook):
+        return acts  # no SAE, no quant — pure baseline
+
+    # 1. Pure model baseline (no SAE, no quant) — should be ~50 PPL
+    ppl_clean = compute_ppl_with_hook(model, eval_batches, identity_hook)
+    print(f"[Diagnostic] Pure model PPL (no SAE):           {ppl_clean:.2f}")
+
+    # 2. SAE reconstruction PPL (no quantization) — tells you SAE quality
+    ppl_sae = compute_ppl_with_hook(model, eval_batches, clean_sae_hook)
+    print(f"[Diagnostic] SAE reconstruction PPL (no quant): {ppl_sae:.2f}")
+
+    # 3. CE-loss-recovered metric (standard SAE eval metric)
+    import math
+    ce_clean = math.log(ppl_clean)
+    ce_sae = math.log(ppl_sae)
+    
     for mode in modes:
         print(f"\nMode: {mode}")
 
@@ -412,7 +434,7 @@ for m_bottleneck in m:
                 label = "Standard_Pass_baseline"
 
             wandb.init(
-            project="sae-quantization-pt3",
+            project="sae-quantization-test",
             name=f"{mode}_{label}_analysis_{m_bottleneck}",
             reinit=True
             )

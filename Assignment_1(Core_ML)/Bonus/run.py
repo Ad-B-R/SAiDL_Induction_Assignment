@@ -157,7 +157,7 @@ def train(cfg: DictConfig):
                 torch.cuda.reset_peak_memory_stats(device)
 
             wandb.init(
-                project="aft-master-ablation", 
+                project="transformer-master-ablation", 
                 name=f"{attn}_seq_{cfg.seq_len}_Standard", 
                 config=OmegaConf.to_container(cfg, resolve=True),
                 reinit=True 

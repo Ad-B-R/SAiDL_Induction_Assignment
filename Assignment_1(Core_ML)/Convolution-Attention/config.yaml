@@ -8,6 +8,7 @@ epochs: 2
 vocab_size: 50257  
 d_model: 256   
 d_ff: 1024         
+h: 8               
 num_layers: 4      
 dropout: 0.1   
 

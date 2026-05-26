@@ -16,7 +16,7 @@ class ConvOnlyBlock(nn.Module):
         self.feed_forward_network = feed_forward_block
         self.residual_connections = nn.ModuleList([conformer.ResidualConnections(features, dropout) for _ in range(2)])
 
-    def forward(self, x): 
+    def forward(self, x, mask=None): 
         x = self.residual_connections[0](x, self.conv_block)
         x = self.residual_connections[1](x, self.feed_forward_network)
         return x
@@ -28,7 +28,7 @@ class ConvAttentionBlock(nn.Module):
         self.feed_forward_network = feed_forward_block
         self.residual_connections = nn.ModuleList([conformer.ResidualConnections(features, dropout) for _ in range(2)])
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         x = self.residual_connections[0](x, self.conv_block)
         x = self.residual_connections[1](x, self.feed_forward_network)
         return x

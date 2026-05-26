@@ -49,11 +49,11 @@ class Conformer(nn.Module):
         
         attention_math = conformer.SlidingWindowAttention
         attention_body = conformer.StandardAttentionMask
-        w = getattr(cfg.attention, "window_size", 64)
+        w = 64
 
         alibi_pe = conformer.AlibiPosition
         layers = []
-        num_layers = cfg.num_layers
+        num_layers = cfg.num_layers*2
         
         for i in range(num_layers):
             ffn = conformer.FeedForwardNetwork(cfg.d_model, cfg.d_ff, cfg.dropout)
@@ -64,7 +64,6 @@ class Conformer(nn.Module):
                 else:
                     attn_instance = attention_math(cfg.d_model, cfg.h, cfg.dropout, alibi_fn=alibi_pe(cfg.h))
                     layers.append(conformer.ConvAttentionBlock(cfg.d_model, attn_instance, ffn, cfg.dropout))
-                    
             elif cfg.attention_type == "interleaved":
                 if i % 2 == 0:
                     layers.append(conv.ConvOnlyBlock(cfg.d_model, ffn, cfg.dropout))
@@ -72,7 +71,7 @@ class Conformer(nn.Module):
                     attn_instance = attention_math(cfg.d_model, cfg.h, cfg.dropout, alibi_fn=alibi_pe(cfg.h))
                     layers.append(conformer.ConvAttentionBlock(cfg.d_model, attn_instance, ffn, cfg.dropout))
 
-        self.transformer = attention_body(cfg.d_model, layers, window=w)
+        self.transformer = attention_body(cfg.d_model, nn.ModuleList(layers), window=w)
         
         self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
 
@@ -98,7 +97,7 @@ def train(cfg: DictConfig):
     multipliers = [2]
     for attn in attention_types:
         for mult in multipliers:
-            cfg.attention = attn
+            cfg.attention_type = attn
             cfg.seq_len = base_seq_len * mult
             cfg.batch_size = max(1, base_batch_size // mult) 
             
@@ -107,7 +106,7 @@ def train(cfg: DictConfig):
 
             wandb.init(
                 project="transformer-master-ablation", 
-                name=f"{attn}_seq_{cfg.seq_len}_Standard", 
+                name=f"{attn}_seq_{cfg.seq_len}_Standard_kernel_9", 
                 config=OmegaConf.to_container(cfg, resolve=True),
                 reinit=True 
             )
