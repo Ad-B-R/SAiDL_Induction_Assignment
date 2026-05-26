@@ -14,37 +14,34 @@ import matplotlib.pyplot as plt
 import umap
 import numpy as np
 device = "cuda" if torch.cuda.is_available() else "cpu"
+from sae_lens import SAE
 
-model = HookedTransformer.from_pretrained("distilgpt2")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = HookedTransformer.from_pretrained("distilgpt2", device=device)
 tokenizer = model.tokenizer
 model.eval()
 
-m = [512,1024]
-for m_bottleneck in m:
-    class TopKSAE(nn.Module):
-        def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
-            super().__init__()
-            self.encoder = nn.Linear(input_dim, hidden_dim)
-            self.decoder = nn.Linear(hidden_dim, input_dim)
-            self.k = int(hidden_dim * k_percent)
+checkpoint_paths = {
+    512: "./sae_checkpoints_saelens/m512/2ezt06ox/90910720",  
+    1024: "./sae_checkpoints_saelens/m1024/q9f9m5nl/90910720" 
+}
 
-        def forward(self, x):
-            encoded = self.encoder(x)
-            topk_values, topk_indices = torch.topk(encoded, self.k, dim=-1)
-            sparse_encoded = torch.zeros_like(encoded)
-            sparse_encoded.scatter_(-1, topk_indices, topk_values)
-            reconstructed = self.decoder(sparse_encoded)
-            return reconstructed, sparse_encoded
+loaded_saes = {}
 
-    sae_model = TopKSAE(hidden_dim=m_bottleneck).to(device)
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    weights_folder = os.path.join(current_script_dir, "weights")
-    model_file_name = f"sae_m{m_bottleneck}_final_100k.pt"
-    final_weights_path = os.path.join(weights_folder, model_file_name)
-
-    sae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
+# 3. The Loading Loop
+for m_bottleneck, folder_path in checkpoint_paths.items():
+    print(f"Loading SAELens model for m={m_bottleneck}...")
+    
+    sae_model = SAE.load_from_pretrained(
+        folder_path, 
+        device=device
+    )
     sae_model.eval()
+    loaded_saes[m_bottleneck] = sae_model
 
+    print("\nSuccessfully loaded all SAEs!")
+    print(f"m={m_bottleneck} configured d_sae: {loaded_saes[m_bottleneck].cfg.d_sae}")
 
     dataset = load_dataset("openwebtext", split="train", streaming=True)
     skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
@@ -121,7 +118,7 @@ for m_bottleneck in m:
             
             _, cache = model.run_with_cache(batch)
             acts = cache["blocks.2.hook_resid_pre"]
-            _, sparse_feats = sae_model(acts) 
+            sparse_feats = sae_model.encode(acts) 
             batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
             batch_max = sparse_feats.amax(dim=(0,1))
 
@@ -141,7 +138,7 @@ for m_bottleneck in m:
     def get_intervention_hook(bits, mode="per_tensor"):
         def hook(activations, hook):
             orig_acts = activations
-            _, sparse_feats = sae_model(orig_acts)
+            sparse_feats = sae_model.encode(orig_acts)
 
             if bits is not None:
                 if mode == "per_tensor":
@@ -153,7 +150,7 @@ for m_bottleneck in m:
                         bits,
                         sparse_feats
                     )
-                reconstructed = sae_model.decoder(damaged_feats)
+                reconstructed = sae_model.decode(damaged_feats)
             else:
                 damaged_feats = sparse_feats
                 reconstructed = orig_acts
@@ -239,6 +236,8 @@ for m_bottleneck in m:
                     if bits is not None:
                         total_mse += nn.MSELoss()(recon_acts, clean_acts).item()
                         total_sds += SDS(Z=Z, Z_hat=Z_hat, k=32)
+                        total_sds_64 += SDS(Z=Z, Z_hat=Z_hat, k=64)
+                        total_sds_128 += SDS(Z=Z, Z_hat=Z_hat, k=128)
                         total_cka += CKA(X=recon_acts.view(-1, clean_acts.size(-1)), Y = clean_acts.view(-1, clean_acts.size(-1)))
 
                     # 4. Save UMAP Data
@@ -256,13 +255,19 @@ for m_bottleneck in m:
                             "mse": total_mse / (idx+1) if bits is not None else 0,
                             "cka": total_cka / (idx+1) if bits is not None else 0,
                             "sds": total_sds / (idx+1) if bits is not None else 0
+                            "sds_64": total_sds_64 / (idx+1) if bits is not None else 0
+                            "sds_128": total_sds_128 / (idx+1) if bits is not None else 0
                         })
                     idx += 1
             Z_full = torch.cat(Z_all)
             Z_hat_full = torch.cat(Z_hat_all)
 
             global_sds = SDS(Z_full, Z_hat_full, k=32)
+            global_sds_64 = SDS(Z_full, Z_hat_full, k=64)
+            global_sds_128 = SDS(Z_full, Z_hat_full, k=128)
             wandb.log({
+                "global_sds_64": global_sds_64
+                "global_sds_128": global_sds_128
                 "global_sds": global_sds
             })
             avg_loss = total_loss / len(eval_batches)

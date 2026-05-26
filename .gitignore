@@ -6,8 +6,12 @@ run_all.py
 main.tex
 test.py
 sae_checkpoints/
+sae_checkpoints_64/
+vae_checkpoints_64/
 *.pt
 *.pth
 tmp_owt_cache/
 clean_env/
 tea_debug.log
+sae_checkpoints_saelens/
+output/

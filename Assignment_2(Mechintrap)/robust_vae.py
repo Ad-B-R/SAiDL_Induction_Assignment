@@ -21,7 +21,7 @@ model.eval()
 
 tokenizer = model.tokenizer
 k = 0
-m = [512,1024]
+m = [512]
 for m_bottleneck in m:
     class VAE(nn.Module):
         def __init__(self, input_dim=768, latent_dim=1024):
@@ -48,7 +48,7 @@ for m_bottleneck in m:
     vae_model = VAE(input_dim=768, latent_dim=m_bottleneck).to(device)
     current_script_dir = os.path.dirname(os.path.abspath(__file__))
     weights_folder = os.path.join(current_script_dir, "weights")
-    model_file_name = f"vae_m{m_bottleneck}_final_100k.pt"
+    model_file_name = f"vae_m{m_bottleneck}_step{10000}.pt"
     final_weights_path = os.path.join(weights_folder, model_file_name)
 
     vae_model.load_state_dict(torch.load(final_weights_path, map_location=device))

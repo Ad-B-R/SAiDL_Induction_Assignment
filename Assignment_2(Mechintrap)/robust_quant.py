@@ -11,570 +11,563 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import math
 import wandb
 from datasets import load_dataset
+from sae_lens import SAE
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-model = HookedTransformer.from_pretrained("distilgpt2")
-model = model.to(device)
+model = HookedTransformer.from_pretrained("distilgpt2", device=device)
+tokenizer = model.tokenizer
 model.eval()
 
-tokenizer = model.tokenizer
-k = 0
-m = [512,1024]
-for m_bottleneck in m:
-    class TopKSAE(nn.Module):
-        def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
-            super().__init__()
-            self.encoder = nn.Linear(input_dim, hidden_dim)
-            self.decoder = nn.Linear(hidden_dim, input_dim)
-            self.k = int(hidden_dim * k_percent)
+checkpoint_paths = {
+    512: "./sae_checkpoints_saelens/m512/2ezt06ox/90910720",  
+    1024: "./sae_checkpoints_saelens/m1024/q9f9m5nl/90910720" 
+}
 
-        def forward(self, x):
-            encoded = self.encoder(x)
-            topk_values, topk_indices = torch.topk(encoded, self.k, dim=-1)
-            sparse_encoded = torch.zeros_like(encoded)
-            sparse_encoded.scatter_(-1, topk_indices, topk_values)
-            reconstructed = self.decoder(sparse_encoded)
-            return reconstructed, sparse_encoded
-
-    sae_model = TopKSAE(hidden_dim=m_bottleneck).to(device)
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    weights_folder = os.path.join(current_script_dir, "weights")
-    model_file_name = f"sae_m{m_bottleneck}_final_100k.pt"
-    final_weights_path = os.path.join(weights_folder, model_file_name)
-
-    sae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
-    sae_model.eval()
-
-    dataset = load_dataset("openwebtext", split="train", streaming=True)
-    skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
-
-    hook_point = "blocks.2.hook_resid_pre"
-
-    def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
-        batch_texts = []
-        token_buffer = []
-        batches_yielded = 0
-
-        for example in dataset_stream:
-            tokens = tokenizer(example["text"], return_tensors="pt")["input_ids"][0]
-            token_buffer.extend(tokens.tolist())
-
-            while len(token_buffer) >= seq_len:
-                chunk = token_buffer[:seq_len:1]
-                token_buffer = token_buffer[seq_len::1]
-
-                batch_texts.append(torch.tensor(chunk).unsqueeze(0)) 
-
-                if len(batch_texts) == batch_size:
-                    yield torch.cat(batch_texts, dim=0).to(device)
-                    batch_texts = []
-                    batches_yielded += 1
-                    if batches_yielded >= num_batches:
-                        return # Stop the generator once we hit our eval limit
-                        
-    def compute_jacobian_norms(sae_model, acts):
-        acts = acts.clone().detach().requires_grad_(True)
-
-        B, T, D = acts.shape
-        flat = acts.view(-1, D)
-
-        _, Z = sae_model(flat)  # [N, F]
-
-        grad_outputs = torch.ones_like(Z)
-
-        grads = torch.autograd.grad(
-            outputs=Z,
-            inputs=acts,
-            grad_outputs=grad_outputs,
-            retain_graph=False
-        )[0]
-
-        # map to feature importance (approx)
-        importance = Z.abs().mean(dim=0)
-
-        return importance
-
-    def compute_fisher(Z):
-        return (Z ** 2).mean(dim=0)
-    
-    def quantize_gen(min, max, bit, tensor):
-
-        if bit >= 16:
-            return tensor   # exact pass-through
-
-        qmax = 2**bit - 1
-
-        scale = (max-min)/qmax
-
-        q = torch.round(
-            (tensor-min)/(scale + 1e-12)
+loaded_saes = {}
+for k_sds in [32,64,128]:
+    for m_bottleneck, folder_path in checkpoint_paths.items():
+        print(f"Loading SAELens model for m={m_bottleneck}...")
+        
+        sae_model = SAE.load_from_pretrained(
+            folder_path, 
+            device=device
         )
+        sae_model.eval()
+        loaded_saes[m_bottleneck] = sae_model
 
-        q = q.clamp(0,qmax)
+        print("\nSuccessfully loaded all SAEs!")
+        print(f"m={m_bottleneck} configured d_sae: {loaded_saes[m_bottleneck].cfg.d_sae}")
 
-        return q*scale + min
+
+        dataset = load_dataset("openwebtext", split="train", streaming=True)
+        skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
+
+        hook_point = "blocks.2.hook_resid_pre"
+
+        def get_eval_batches(dataset_stream, num_batches, batch_size=32, seq_len=128):
+            batch_texts = []
+            token_buffer = []
+            batches_yielded = 0
+
+            for example in dataset_stream:
+                tokens = tokenizer(example["text"], return_tensors="pt")["input_ids"][0]
+                token_buffer.extend(tokens.tolist())
+
+                while len(token_buffer) >= seq_len:
+                    chunk = token_buffer[:seq_len:1]
+                    token_buffer = token_buffer[seq_len::1]
+
+                    batch_texts.append(torch.tensor(chunk).unsqueeze(0)) 
+
+                    if len(batch_texts) == batch_size:
+                        yield torch.cat(batch_texts, dim=0).to(device)
+                        batch_texts = []
+                        batches_yielded += 1
+                        if batches_yielded >= num_batches:
+                            return # Stop the generator once we hit our eval limit
+                            
+        def compute_jacobian_norms(sae_model, acts):
+            acts = acts.clone().detach().requires_grad_(True)
+
+            B, T, D = acts.shape
+            flat = acts.view(-1, D)
+
+            Z = sae_model.encode(flat)  # [N, F]
+
+            grad_outputs = torch.ones_like(Z)
+
+            grads = torch.autograd.grad(
+                outputs=Z,
+                inputs=acts,
+                grad_outputs=grad_outputs,
+                retain_graph=False
+            )[0]
+
+            # map to feature importance (approx)
+            importance = Z.abs().mean(dim=0)
+
+            return importance
+
+        def compute_fisher(Z):
+            return (Z ** 2).mean(dim=0)
+        
+        def quantize_gen(min, max, bit, tensor):
+
+            if bit >= 16:
+                return tensor   # exact pass-through
+
+            qmax = 2**bit - 1
+
+            scale = (max-min)/qmax
+
+            q = torch.round(
+                (tensor-min)/(scale + 1e-12)
+            )
+
+            q = q.clamp(0,qmax)
+
+            return q*scale + min
+        
+        def compute_subspace(Z, k=256):
+            Zc = Z - Z.mean(dim=0, keepdim=True)
+            U, S, Vh = torch.linalg.svd(Zc, full_matrices=False)
+
+            Vk = Vh[:k].T   # [D, k]
+            Vk, _ = torch.linalg.qr(Vk)
+            mean = Z.mean(dim=0, keepdim=True)
+
+            return Vk, mean
+
+        def decompose_subspace(Z, Vk, mean):
+            Zc = Z - mean
+
+            Z_proj = (Zc @ Vk) @ Vk.T
+            Z_res = Zc - Z_proj
+
+            return Z_proj, Z_res
+        
+        def get_range(x, p=0.999):
+            high = torch.quantile(x, p)
+            low = torch.quantile(x, 1 - p)
+            return low, high
     
-    def compute_subspace(Z, k=256):
-        Zc = Z - Z.mean(dim=0, keepdim=True)
-        U, S, Vh = torch.linalg.svd(Zc, full_matrices=False)
+        def subspace_quantize(Z, Vk, mean, bits_high=8, bits_low=2,
+                            min_val=None, max_val=None):
 
-        Vk = Vh[:k].T   # [D, k]
-        Vk, _ = torch.linalg.qr(Vk)
-        mean = Z.mean(dim=0, keepdim=True)
+            sparsity_mask = (Z != 0.0).float()
 
-        return Vk, mean
+            Zc = Z-mean
+            C = Zc @ Vk  # Shape: [Batch, k]
+            
+            C_min, C_max = get_range(C) # MUST be per-channel for SVD
+            
+            if bits_high == 16:
+                C_q = C
+            else:
+                C_q = quantize_gen(C_min, C_max, bits_high, C)
+            Z_proj_q = C_q @ Vk.T
+            Z_res = Zc - (C @ Vk.T)
+            res_min, res_max = get_range(Z_res) 
+            
+            if bits_low == 16:
+                Z_res_q = Z_res
+            else:
+                Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
 
-    def decompose_subspace(Z, Vk, mean):
-        Zc = Z - mean
+            Z_hat = Z_proj_q + Z_res_q + mean
 
-        Z_proj = (Zc @ Vk) @ Vk.T
-        Z_res = Zc - Z_proj
+            Z_hat = Z_hat * sparsity_mask
 
-        return Z_proj, Z_res
-    
-    def get_range(x, p=0.999):
-        high = torch.quantile(x, p)
-        low = torch.quantile(x, 1 - p)
-        return low, high
- 
-    def subspace_quantize(Z, Vk, mean, bits_high=8, bits_low=2,
-                          min_val=None, max_val=None):
+            return Z_hat
 
-        sparsity_mask = (Z != 0.0).float()
+        def compute_cka(X, Y):
+            X = X - X.mean(0, keepdim=True)
+            Y = Y - Y.mean(0, keepdim=True)
 
-        Zc = Z-mean
-        C = Zc @ Vk  # Shape: [Batch, k]
-        
-        C_min, C_max = get_range(C) # MUST be per-channel for SVD
-        
-        if bits_high == 16:
-            C_q = C
-        else:
-            C_q = quantize_gen(C_min, C_max, bits_high, C)
-        Z_proj_q = C_q @ Vk.T
-        Z_res = Zc - (C @ Vk.T)
-        res_min, res_max = get_range(Z_res) 
-        
-        if bits_low == 16:
-            Z_res_q = Z_res
-        else:
-            Z_res_q = quantize_gen(res_min, res_max, bits_low, Z_res)
+            K = X @ X.T
+            L = Y @ Y.T
 
-        Z_hat = Z_proj_q + Z_res_q + mean
+            hsic = (K * L).sum()
+            norm_x = torch.norm(K)
+            norm_y = torch.norm(L)
 
-        Z_hat = Z_hat * sparsity_mask
+            return (hsic / (norm_x * norm_y + 1e-9)).item()
 
-        return Z_hat
+        def spectral_analysis(Z, Z_hat, k=32):
 
-    def compute_cka(X, Y):
-        X = X - X.mean(0, keepdim=True)
-        Y = Y - Y.mean(0, keepdim=True)
+            Z_c = Z - Z.mean(dim=0, keepdim=True)
+            Z_c_hat = Z_hat - Z_hat.mean(dim=0, keepdim=True)
 
-        K = X @ X.T
-        L = Y @ Y.T
+            U, S, V = torch.svd_lowrank(Z_c, q=k)
+            U_hat, S_hat, V_hat = torch.svd_lowrank(Z_c_hat, q=k)
 
-        hsic = (K * L).sum()
-        norm_x = torch.norm(K)
-        norm_y = torch.norm(L)
+            Uk = V[:, :k]
+            Uk_hat = V_hat[:, :k]
 
-        return (hsic / (norm_x * norm_y + 1e-9)).item()
+            cos_thetas = torch.linalg.svdvals(Uk.T @ Uk_hat)
+            angles = torch.acos(torch.clamp(cos_thetas, -1, 1)) * (180 / math.pi)
 
-    def spectral_analysis(Z, Z_hat, k=32):
+            E = Z - Z_hat
+            sds = (torch.norm(E @ Uk)**2 / torch.norm(Z @ Uk)**2).item()
 
-        Z_c = Z - Z.mean(dim=0, keepdim=True)
-        Z_c_hat = Z_hat - Z_hat.mean(dim=0, keepdim=True)
+            return {
+                "singular_before": S,
+                "singular_after": S_hat,
+                "angles": angles,
+                "sds": sds
+            }
 
-        U, S, V = torch.svd_lowrank(Z_c, q=k)
-        U_hat, S_hat, V_hat = torch.svd_lowrank(Z_c_hat, q=k)
+        def compute_calibration_subspace(model, sae_model, calib_batches, device, k=64):
+            Z_calib_all = []
 
-        Uk = V[:, :k]
-        Uk_hat = V_hat[:, :k]
+            with torch.no_grad():
+                for batch in calib_batches:
 
-        cos_thetas = torch.linalg.svdvals(Uk.T @ Uk_hat)
-        angles = torch.acos(torch.clamp(cos_thetas, -1, 1)) * (180 / math.pi)
+                    seq_len = batch.size(1)
+                    pos = torch.arange(seq_len, device=device).unsqueeze(0)
 
-        E = Z - Z_hat
-        sds = (torch.norm(E @ Uk)**2 / torch.norm(Z @ Uk)**2).item()
+                    _, cache = model.run_with_cache(batch)
+                    acts = cache["blocks.2.hook_resid_pre"]
+                    Z = sae_model.encode(acts)
 
-        return {
-            "singular_before": S,
-            "singular_after": S_hat,
-            "angles": angles,
-            "sds": sds
-        }
+                    Z_calib_all.append(Z.view(-1, Z.size(-1)))
 
-    def compute_calibration_subspace(model, sae_model, calib_batches, device, k=64):
-        Z_calib_all = []
+            Z_calib = torch.cat(Z_calib_all)
+
+            Vk_global, mean_global = compute_subspace(Z_calib, k=k)
+
+            return Vk_global, mean_global
+
+        print("\nCalibrating Min/Max ranges on held-out data...")
+
+        calib_batches = list(get_eval_batches(skip_dataset, num_batches=1))
+        global_min, global_max = float('inf'), float('-inf')
+        feature_min, feature_max = None, None
+
+        eval_batches = list(get_eval_batches(skip_dataset, num_batches=5))
+
+        Vk_global, mean_global = compute_calibration_subspace(
+            model,
+            sae_model,
+            calib_batches,
+            device,
+            k=256
+        )
 
         with torch.no_grad():
             for batch in calib_batches:
 
                 seq_len = batch.size(1)
                 pos = torch.arange(seq_len, device=device).unsqueeze(0)
-
-                _, cache = model.run_with_cache(batch)
-                acts = cache["blocks.2.hook_resid_pre"]
-                _, Z = sae_model(acts)
-
-                Z_calib_all.append(Z.view(-1, Z.size(-1)))
-
-        Z_calib = torch.cat(Z_calib_all)
-
-        Vk_global, mean_global = compute_subspace(Z_calib, k=k)
-
-        return Vk_global, mean_global
-
-    print("\nCalibrating Min/Max ranges on held-out data...")
-
-    calib_batches = list(get_eval_batches(skip_dataset, num_batches=1))
-    global_min, global_max = float('inf'), float('-inf')
-    feature_min, feature_max = None, None
-
-    eval_batches = list(get_eval_batches(skip_dataset, num_batches=5))
-
-    Vk_global, mean_global = compute_calibration_subspace(
-        model,
-        sae_model,
-        calib_batches,
-        device,
-        k=256
-    )
-
-    with torch.no_grad():
-        for batch in calib_batches:
-
-            seq_len = batch.size(1)
-            pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            
-            # Start with Embeddings
-            
-            _, cache = model.run_with_cache(batch)
-            acts = cache["blocks.2.hook_resid_pre"]
-            _, sparse_feats = sae_model(acts) 
-            batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
-            batch_max = sparse_feats.amax(dim=(0,1))
-
-            global_min = min(global_min, batch_min.min().item())
-            global_max = max(global_max, batch_max.max().item())
-
-            if feature_min is None:
-                feature_min = batch_min
-                feature_max = batch_max
-            else:
-                feature_min = torch.minimum(feature_min, batch_min)
-                feature_max = torch.maximum(feature_max, batch_max)
-
-    print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
-    def normalize(x):
-        return (x - x.mean()) / (x.std() + 1e-8)    
-  
-    def compute_importance(k):
-        all_Z = []
-        acts_samples = []
-        max_samples = 25
-        with torch.no_grad():
-            for batch in eval_batches:
-                _, cache = model.run_with_cache(batch)
-                acts = cache["blocks.2.hook_resid_pre"]
-                if len(acts_samples) < max_samples:
-                    acts_samples.append(acts.detach())
-
-                B, T, D = acts.shape
-                flat = acts.view(-1, D)
-
-                _, Z_flat = sae_model(flat)
-                Z = Z_flat.view(B, T, -1)
-
-                all_Z.append(Z)
-
-        Z = torch.cat(all_Z, dim=0)
-
-        Z_flat = Z.view(-1, Z.size(-1))
-        jacobian_imp = None
-
-        for acts in acts_samples:
-            J = compute_jacobian_norms(sae_model, acts)
-
-            if jacobian_imp is None:
-                jacobian_imp = J
-            else:
-                jacobian_imp += J
-
-        jacobian_imp /= len(acts_samples)
-        fisher_imp   = compute_fisher(Z_flat)
-
-        F = Z_flat.size(-1)
-        k_val = int(F*k)
-        importance = normalize(jacobian_imp) + normalize(fisher_imp)
-        Z_weighted = Z_flat * importance
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  
-
-        U, S, V = torch.svd(Z_weighted)
-        V, _= torch.linalg.qr(V)
-        Vk_global = V[:, :k_val]
-    
-        return Vk_global
-    
-    Vk_global = compute_importance(k=0.3)
-    
-    bit_configs = [16, 8, 6, 4, 2, None]
-
-    modes = ["subspace", "per_tensor"]
-    umap_data = {
-        "Baseline": [],
-        'per_tensor': {
-        "16-bit_per_tensor": [],
-        "8-bit_per_tensor": [],
-        "6-bit_per_tensor": [],
-        "4-bit_per_tensor": [],
-        "2-bit_per_tensor": []
-        },
-        'subspace': {
-        "16-bit_subspace": [],
-        "8-bit_subspace": [],
-        "6-bit_subspace": [],
-        "4-bit_subspace": [],
-        "2-bit_subspace": []
-        }
-    }
-
-    results = {}
-    def get_quant_hook(mode, bits,
-                    sae_model,
-                    global_min, global_max,
-                    Vk=None, mean=None):
-
-        def hook_fn(acts, hook):
-            # SAE forward
-            _, Z = sae_model(acts)
-
-            if bits is None:
-                return acts  # baseline
-
-            if mode == "per_tensor":
-                Z_hat = quantize_gen(
-                    min=global_min,
-                    max=global_max,
-                    bit=bits,
-                    tensor=Z
-                )
-
-                # preserve exact sparsity
-                Z_hat = Z_hat * (Z != 0).float()
                 
-            elif mode == "subspace":
-                Z_flat = Z.view(-1, Z.size(-1))
+                # Start with Embeddings
+                
+                _, cache = model.run_with_cache(batch)
+                acts = cache["blocks.2.hook_resid_pre"]
+                sparse_feats = sae_model.encode(acts) 
+                batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
+                batch_max = sparse_feats.amax(dim=(0,1))
 
-                Z_hat_flat = subspace_quantize(
-                    Z_flat, Vk_global, mean,
-                    bits_high=16,
-                    bits_low=bits,
-                    min_val=global_min,
-                    max_val=global_max
-                )
+                global_min = min(global_min, batch_min.min().item())
+                global_max = max(global_max, batch_max.max().item())
 
-                Z_hat = Z_hat_flat.view_as(Z)
+                if feature_min is None:
+                    feature_min = batch_min
+                    feature_max = batch_max
+                else:
+                    feature_min = torch.minimum(feature_min, batch_min)
+                    feature_max = torch.maximum(feature_max, batch_max)
 
-            else:
-                raise ValueError(mode)
-
-            recon = sae_model.decoder(Z_hat)
-            return recon
-
-        return hook_fn
-
-    def compute_ppl_with_hook(model, eval_batches, hook_fn):
-        total_loss = 0
-
-        with torch.no_grad():
-            for batch in eval_batches:
-                logits = model.run_with_hooks(
-                    batch,
-                    fwd_hooks=[(hook_point, hook_fn)]
-                )
-
-                loss = model.loss_fn(logits, batch)
-                total_loss += loss.item()
-
-        return math.exp(total_loss / len(eval_batches))
-    def clean_sae_hook(acts, hook):
-        B, T, D = acts.shape
-        flat = acts.view(-1, D)
-        _, Z = sae_model(flat)
-        recon = sae_model.decoder(Z)
-        return recon.view(B, T, D)
-
-    def identity_hook(acts, hook):
-        return acts  # no SAE, no quant — pure baseline
-
-    # 1. Pure model baseline (no SAE, no quant) — should be ~50 PPL
-    ppl_clean = compute_ppl_with_hook(model, eval_batches, identity_hook)
-    print(f"[Diagnostic] Pure model PPL (no SAE):           {ppl_clean:.2f}")
-
-    # 2. SAE reconstruction PPL (no quantization) — tells you SAE quality
-    ppl_sae = compute_ppl_with_hook(model, eval_batches, clean_sae_hook)
-    print(f"[Diagnostic] SAE reconstruction PPL (no quant): {ppl_sae:.2f}")
-
-    # 3. CE-loss-recovered metric (standard SAE eval metric)
-    import math
-    ce_clean = math.log(ppl_clean)
-    ce_sae = math.log(ppl_sae)
+        print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
+        def normalize(x):
+            return (x - x.mean()) / (x.std() + 1e-8)    
     
-    for mode in modes:
-        print(f"\nMode: {mode}")
-
-        for bits in bit_configs:
+        def compute_importance(k):
+            all_Z = []
             acts_samples = []
-            max_samples = 10
-            if bits is not None:
-                label = f"{bits}-bit" if bits!=16 else "Baseline_16_bit"
-            else:
-                label = "Standard_Pass_baseline"
-
-            wandb.init(
-            project="sae-quantization-test",
-            name=f"{mode}_{label}_analysis_{m_bottleneck}",
-            reinit=True
-            )
-            print(f"\nEvaluating: {label}")
-            Z_all = []
-            Z_hat_all = []
-            tokens_all = []
-
-            handle = (None)                
+            max_samples = 25
             with torch.no_grad():
-                idx = 0
-                for batch in tqdm(eval_batches, leave=False):
-
+                for batch in eval_batches:
                     _, cache = model.run_with_cache(batch)
-                    clean_acts = cache["blocks.2.hook_resid_pre"]
-                    B, T, D = clean_acts.shape
-                    flat = clean_acts.view(-1, D)
-
-                    _, sparse_feats_flat = sae_model(flat)
-                    Z_batch = sparse_feats_flat.view(B, T, -1)
+                    acts = cache["blocks.2.hook_resid_pre"]
                     if len(acts_samples) < max_samples:
-                        acts_samples.append(clean_acts[:1].detach())    
-                    
-                    if bits is not None:
-                        if mode == "subspace":
-                        # Flatten for SVD
-                            Z_flat = Z_batch.view(-1, Z_batch.size(-1))
-                        
-                            Z_hat_flat = subspace_quantize(
-                                Z_flat, Vk_global, mean_global,
-                                bits_high=16,
-                                bits_low=bits,
-                                min_val=global_min,
-                                max_val=global_max
-                            )
+                        acts_samples.append(acts.detach())
 
-                            Z_hat_batch = Z_hat_flat.view_as(Z_batch)
-                        
-                        elif mode == "per_tensor":
-                            Z_hat_batch = quantize_gen(min=global_min, max=global_max, bit=bits, tensor=Z_batch)
-                    else:
-                        Z_hat_batch = Z_batch    
+                    B, T, D = acts.shape
+                    flat = acts.view(-1, D)
 
-                    Z = Z_batch.view(-1, Z_batch.size(-1))
-                    Z_hat = Z_hat_batch.view(-1, Z_batch.size(-1))
+                    Z_flat = sae_model.encode(flat)
+                    Z = Z_flat.view(B, T, -1)
 
-                    Z_all.append(Z)
-                    Z_hat_all.append(Z_hat)
-                    tokens_all.append(batch.view(-1))
+                    all_Z.append(Z)
 
-                    recon_acts = sae_model.decoder(Z_hat_batch)
-                    
-                    Z_hat_np = (Z_hat.detach().cpu().numpy())
-                    if bits is None: umap_data["Baseline"].append(Z_hat_np)
-                    else: umap_data[f"{mode}"][f"{bits}-bit_{mode}"].append(Z_hat_np)
-            
-            jacobian = None
+            Z = torch.cat(all_Z, dim=0)
+
+            Z_flat = Z.view(-1, Z.size(-1))
+            jacobian_imp = None
 
             for acts in acts_samples:
                 J = compute_jacobian_norms(sae_model, acts)
-                
-                if jacobian is None:
-                    jacobian = J
+
+                if jacobian_imp is None:
+                    jacobian_imp = J
                 else:
-                    jacobian += J
+                    jacobian_imp += J
 
-            jacobian = jacobian / len(acts_samples)
+            jacobian_imp /= len(acts_samples)
+            fisher_imp   = compute_fisher(Z_flat)
 
-            Z = torch.cat(Z_all)
-            Z_hat = torch.cat(Z_hat_all)
+            F = Z_flat.size(-1)
+            k_val = int(F*k)
+            importance = normalize(jacobian_imp) + normalize(fisher_imp)
+            Z_weighted = Z_flat * importance
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    
 
-            tokens = torch.cat(tokens_all)
-            
-            hook_fn = get_quant_hook(
-                mode=mode,
-                bits=bits,
-                sae_model=sae_model,
-                global_min=global_min,
-                global_max=global_max,
-                Vk=Vk_global,
-                mean=mean_global
-            )
+            U, S, V = torch.svd(Z_weighted)
+            V, _= torch.linalg.qr(V)
+            Vk_global = V[:, :k_val]
+        
+            return Vk_global
+        
+        Vk_global = compute_importance(k=0.3)
+        
+        bit_configs = [16, 8, 6, 4, 2, None]
 
-            ppl = compute_ppl_with_hook(model, eval_batches, hook_fn)
+        modes = ["subspace", "per_tensor"]
+        umap_data = {
+            "Baseline": [],
+            'per_tensor': {
+            "16-bit_per_tensor": [],
+            "8-bit_per_tensor": [],
+            "6-bit_per_tensor": [],
+            "4-bit_per_tensor": [],
+            "2-bit_per_tensor": []
+            },
+            'subspace': {
+            "16-bit_subspace": [],
+            "8-bit_subspace": [],
+            "6-bit_subspace": [],
+            "4-bit_subspace": [],
+            "2-bit_subspace": []
+            }
+        }
 
-            if bits is not None: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
-            else: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
-            spectral = spectral_analysis(Z, Z_hat)
+        results = {}
+        def get_quant_hook(mode, bits,
+                        sae_model,
+                        global_min, global_max,
+                        Vk=None, mean=None):
 
-            fisher = compute_fisher(Z)
+            def hook_fn(acts, hook):
+                # SAE forward
+                Z = sae_model.encode(acts)
 
-            sv_before = spectral["singular_before"]
-            sv_after = spectral["singular_after"]
+                if bits is None:
+                    return acts  # baseline
 
-            # fraction of near-zero singular values
-            collapse_ratio = (sv_after < 1e-3).float().mean().item()
+                if mode == "per_tensor":
+                    Z_hat = quantize_gen(
+                        min=global_min,
+                        max=global_max,
+                        bit=bits,
+                        tensor=Z
+                    )
 
-            # how much variance is lost
-            energy_before = (sv_before**2).sum()
-            energy_after = (sv_after**2).sum()
-            energy_loss = ((energy_before - energy_after) / (energy_before + 1e-9)).item()
-            
-            cka = compute_cka(Z, Z_hat)
-            
-            angles = spectral["angles"]
-            mean_angle = angles.mean().item()
-            max_angle = angles.max().item()
+                    # preserve exact sparsity
+                    Z_hat = Z_hat * (Z != 0).float()
+                    
+                elif mode == "subspace":
+                    Z_flat = Z.view(-1, Z.size(-1))
 
-            def sparsity(x):
-                return (x == 0).float().mean().item()
+                    Z_hat_flat = subspace_quantize(
+                        Z_flat, Vk_global, mean,
+                        bits_high=16,
+                        bits_low=bits,
+                        min_val=global_min,
+                        max_val=global_max
+                    )
 
-            s_before = sparsity(Z)
-            s_after = sparsity(Z_hat)
+                    Z_hat = Z_hat_flat.view_as(Z)
 
-            # how much sparsity changed
-            sparsity_delta = s_after - s_before
+                else:
+                    raise ValueError(mode)
+
+                recon = sae_model.decode(Z_hat)
+                return recon
+
+            return hook_fn
+
+        def compute_ppl_with_hook(model, eval_batches, hook_fn):
+            total_loss = 0
+
+            with torch.no_grad():
+                for batch in eval_batches:
+                    logits = model.run_with_hooks(
+                        batch,
+                        fwd_hooks=[(hook_point, hook_fn)]
+                    )
+
+                    loss = model.loss_fn(logits, batch)
+                    total_loss += loss.item()
+
+            return math.exp(total_loss / len(eval_batches))
+        def clean_sae_hook(acts, hook):
+            B, T, D = acts.shape
+            flat = acts.view(-1, D)
+            Z = sae_model.encode(flat)
+            recon = sae_model.decode(Z)
+            return recon.view(B, T, D)
+
+        def identity_hook(acts, hook):
+            return acts  # no SAE, no quant — pure baseline
+
+        # 1. Pure model baseline (no SAE, no quant) — should be ~50 PPL
+        ppl_clean = compute_ppl_with_hook(model, eval_batches, identity_hook)
+        print(f"[Diagnostic] Pure model PPL (no SAE):           {ppl_clean:.2f}")
+
+        # 2. SAE reconstruction PPL (no quantization) — tells you SAE quality
+        ppl_sae = compute_ppl_with_hook(model, eval_batches, clean_sae_hook)
+        print(f"[Diagnostic] SAE reconstruction PPL (no quant): {ppl_sae:.2f}")
+
+        # 3. CE-loss-recovered metric (standard SAE eval metric)
+        import math
+        ce_clean = math.log(ppl_clean)
+        ce_sae = math.log(ppl_sae)
+        
+        for mode in modes:
+            print(f"\nMode: {mode}")
+
+            for bits in bit_configs:
+                acts_samples = []
+                max_samples = 10
+                if bits is not None:
+                    label = f"{bits}-bit" if bits!=16 else "Baseline_16_bit"
+                else:
+                    label = "Standard_Pass_baseline"
+
+                wandb.init(
+                project=f"sae-quantization-robust-32_sds_{k_sds}",
+                name=f"{mode}_{label}_analysis_{m_bottleneck}",
+                reinit=True
+                )
+                print(f"\nEvaluating: {label}")
+                Z_all = []
+                Z_hat_all = []
+                tokens_all = []
+
+                handle = (None)                
+                with torch.no_grad():
+                    idx = 0
+                    for batch in tqdm(eval_batches, leave=False):
+
+                        _, cache = model.run_with_cache(batch)
+                        clean_acts = cache["blocks.2.hook_resid_pre"]
+                        B, T, D = clean_acts.shape
+                        flat = clean_acts.view(-1, D)
+
+                        sparse_feats_flat = sae_model.encode(flat)
+                        Z_batch = sparse_feats_flat.view(B, T, -1)
+                        if len(acts_samples) < max_samples:
+                            acts_samples.append(clean_acts[:1].detach())    
+                        
+                        if bits is not None:
+                            if mode == "subspace":
+                            # Flatten for SVD
+                                Z_flat = Z_batch.view(-1, Z_batch.size(-1))
+                            
+                                Z_hat_flat = subspace_quantize(
+                                    Z_flat, Vk_global, mean_global,
+                                    bits_high=16,
+                                    bits_low=bits,
+                                    min_val=global_min,
+                                    max_val=global_max
+                                )
+
+                                Z_hat_batch = Z_hat_flat.view_as(Z_batch)
+                            
+                            elif mode == "per_tensor":
+                                Z_hat_batch = quantize_gen(min=global_min, max=global_max, bit=bits, tensor=Z_batch)
+                        else:
+                            Z_hat_batch = Z_batch    
+
+                        Z = Z_batch.view(-1, Z_batch.size(-1))
+                        Z_hat = Z_hat_batch.view(-1, Z_batch.size(-1))
+
+                        Z_all.append(Z)
+                        Z_hat_all.append(Z_hat)
+                        tokens_all.append(batch.view(-1))
+
+                        recon_acts = sae_model.decode(Z_hat_batch)
+                        
+                        Z_hat_np = (Z_hat.detach().cpu().numpy())
+                        if bits is None: umap_data["Baseline"].append(Z_hat_np)
+                        else: umap_data[f"{mode}"][f"{bits}-bit_{mode}"].append(Z_hat_np)
                 
-            wandb.log({
-                "bit_high": 16,
-                "k_value": k,
-                "Perplexity": ppl,
-                "jacobian_mean": jacobian.mean().item(),
-                "fisher_mean": fisher.mean().item(),
-                "collapse_ratio": collapse_ratio,
-                "energy_loss": energy_loss,
-                "sparsity_before": s_before,
-                "sparsity_after": s_after,
-                "sparsity_delta": sparsity_delta,
-                "angle_mean": mean_angle,
-                "angle_max": max_angle,
-                "CKA": cka,
-                "SDS": spectral["sds"]
-            })                
+                jacobian = None
 
-            print(f" Summary ({label})")
-            print(f"Representation Damage:")
-            print(f"SDS: {spectral['sds']:.4f}")
-            print(f"Angle: {spectral['angles'].mean().item():.2f}°")
-            
-            print(f"\nCausal Alignment (Damage vs Perplexity Impact):")
+                for acts in acts_samples:
+                    J = compute_jacobian_norms(sae_model, acts)
+                    
+                    if jacobian is None:
+                        jacobian = J
+                    else:
+                        jacobian += J
 
-    print("<------------------- ROBUST QUANTIZATION FINISHED --------------------------->")
-    print("<------------------- SUCCESS --------------------------->")  
+                jacobian = jacobian / len(acts_samples)
+
+                Z = torch.cat(Z_all)
+                Z_hat = torch.cat(Z_hat_all)
+
+                tokens = torch.cat(tokens_all)
+                
+                hook_fn = get_quant_hook(
+                    mode=mode,
+                    bits=bits,
+                    sae_model=sae_model,
+                    global_min=global_min,
+                    global_max=global_max,
+                    Vk=Vk_global,
+                    mean=mean_global
+                )
+
+                ppl = compute_ppl_with_hook(model, eval_batches, hook_fn)
+
+                if bits is not None: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
+                else: print(f"{mode} | {bits}-bit → PPL: {ppl:.2f}")
+                spectral = spectral_analysis(Z, Z_hat, k=k_sds)
+
+                fisher = compute_fisher(Z)
+
+                sv_before = spectral["singular_before"]
+                sv_after = spectral["singular_after"]
+
+                # fraction of near-zero singular values
+                collapse_ratio = (sv_after < 1e-3).float().mean().item()
+
+                # how much variance is lost
+                energy_before = (sv_before**2).sum()
+                energy_after = (sv_after**2).sum()
+                energy_loss = ((energy_before - energy_after) / (energy_before + 1e-9)).item()
+                
+                cka = compute_cka(Z, Z_hat)
+                
+                angles = spectral["angles"]
+                mean_angle = angles.mean().item()
+                max_angle = angles.max().item()
+
+                def sparsity(x):
+                    return (x == 0).float().mean().item()
+
+                s_before = sparsity(Z)
+                s_after = sparsity(Z_hat)
+
+                # how much sparsity changed
+                sparsity_delta = s_after - s_before
+                    
+                wandb.log({
+                    "bit_high": 16,
+                    "k_value": k,
+                    "Perplexity": ppl,
+                    "jacobian_mean": jacobian.mean().item(),
+                    "fisher_mean": fisher.mean().item(),
+                    "collapse_ratio": collapse_ratio,
+                    "energy_loss": energy_loss,
+                    "sparsity_before": s_before,
+                    "sparsity_after": s_after,
+                    "sparsity_delta": sparsity_delta,
+                    "angle_mean": mean_angle,
+                    "angle_max": max_angle,
+                    "CKA": cka,
+                    "SDS": spectral["sds"]
+                })                
+
+                print(f" Summary ({label})")
+                print(f"Representation Damage:")
+                print(f"SDS: {spectral['sds']:.4f}")
+                print(f"Angle: {spectral['angles'].mean().item():.2f}°")
+                
+                print(f"\nCausal Alignment (Damage vs Perplexity Impact):")
+
+        print("<------------------- ROBUST QUANTIZATION FINISHED --------------------------->")
+        print("<------------------- SUCCESS --------------------------->")  

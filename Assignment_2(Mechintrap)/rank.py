@@ -1,6 +1,4 @@
 import huggingface_hub
-
-# 3. Now the scanner will pass BERT safely, and this will work:
 from transformer_lens import HookedTransformer
 from scipy.stats import spearmanr
 from datasets import load_dataset
@@ -15,40 +13,34 @@ import math
 import wandb
 from datasets import load_dataset
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print(device)
+from sae_lens import SAE
 
-model = HookedTransformer.from_pretrained("distilgpt2")
-model = model.to(device)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model = HookedTransformer.from_pretrained("distilgpt2", device=device)
+tokenizer = model.tokenizer
 model.eval()
 
-tokenizer = model.tokenizer
+checkpoint_paths = {
+    512: "./sae_checkpoints_saelens/m512/2ezt06ox/90910720",  
+    1024: "./sae_checkpoints_saelens/m1024/q9f9m5nl/90910720" 
+}
 
-m = [1024]
-for m_bottleneck in m:
-    class TopKSAE(nn.Module):
-        def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
-            super().__init__()
-            self.encoder = nn.Linear(input_dim, hidden_dim)
-            self.decoder = nn.Linear(hidden_dim, input_dim)
-            self.k = int(hidden_dim * k_percent)
+loaded_saes = {}
 
-        def forward(self, x):
-            encoded = self.encoder(x)
-            topk_values, topk_indices = torch.topk(encoded, self.k, dim=-1)
-            sparse_encoded = torch.zeros_like(encoded)
-            sparse_encoded.scatter_(-1, topk_indices, topk_values)
-            reconstructed = self.decoder(sparse_encoded)
-            return reconstructed, sparse_encoded
-
-    sae_model = TopKSAE(hidden_dim=m_bottleneck).to(device)
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    weights_folder = os.path.join(current_script_dir, "weights")
-    model_file_name = f"sae_m{m_bottleneck}_final_100k.pt"
-    final_weights_path = os.path.join(weights_folder, model_file_name)
-
-    sae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
+for m_bottleneck, folder_path in checkpoint_paths.items():
+    print(f"Loading SAELens model for m={m_bottleneck}...")
+    
+    sae_model = SAE.load_from_pretrained(
+        folder_path, 
+        device=device
+    )
     sae_model.eval()
+    loaded_saes[m_bottleneck] = sae_model
+
+    print("\nSuccessfully loaded all SAEs!")
+    print(f"m={m_bottleneck} configured d_sae: {loaded_saes[m_bottleneck].cfg.d_sae}")
+
 
     dataset = load_dataset("openwebtext", split="train", streaming=True)
     skip_dataset = dataset.skip(600_000) # skip 400k data so that there is no collision between training and testing data
@@ -92,13 +84,13 @@ for m_bottleneck in m:
     def flatten_sae_forward(acts, sae_model):
         B, T, D = acts.shape
         flat = acts.view(-1, D)
-        _, feats = sae_model(flat)
+        feats = sae_model.encode(flat)
         return feats.view(B, T, -1)
 
     def decode_sae(feats, sae_model):
         B, T, H = feats.shape
         flat = feats.view(-1, H)
-        recon = sae_model.decoder(flat)
+        recon = sae_model.decode(flat)
         return recon.view(B, T, -1)
 
     def compute_neuron_scores(Z, Z_hat, bins=50):
@@ -177,14 +169,14 @@ for m_bottleneck in m:
         def hook_fn(activations, hook):
             B, T, D = activations.shape
             flat = activations.view(-1, D)
-            _, feats = sae_model(flat)
+            feats = sae_model.encode(flat)
             feats = feats.view(B, T, -1)
 
             ablated_acts = activations.clone()
             
             for n in neurons:
                 neuron_act = feats[..., n].unsqueeze(-1)
-                neuron_dir = sae_model.decoder.weight[:, n].view(1, 1, D)
+                neuron_dir = sae_model.W_dec[n, :].view(1, 1, D)
                 ablated_acts = ablated_acts - (neuron_act * neuron_dir)
 
             return ablated_acts
@@ -218,13 +210,11 @@ for m_bottleneck in m:
             def hook_fn(activations, hook, neuron=n):
                 B, T, D = activations.shape
                 flat = activations.view(-1, D)
-                _, feats = sae_model(flat)
+                feats = sae_model.encode(flat)
                 feats = feats.view(B, T, -1)
 
-                # THE SCALPEL: Subtract only the specific neuron's contribution
                 neuron_act = feats[..., neuron].unsqueeze(-1) # [B, T, 1]
-                neuron_dir = sae_model.decoder.weight[:, neuron].view(1, 1, D) # [1, 1, D]
-                
+                neuron_dir = sae_model.W_dec[n, :].view(1, 1, D)                
                 # Subtract from the ORIGINAL activations
                 ablated_acts = activations - (neuron_act * neuron_dir)
 
@@ -277,18 +267,14 @@ for m_bottleneck in m:
             for i in idx:
                 i_val = i.item()
                 
-                # 2. Grab the surrounding tokens (preventing out-of-bounds errors)
                 start = max(0, i_val - context_size)
                 end = min(tokens.size(0), i_val + 1)
                 
-                # 3. Decode the context window
                 context_str = tokenizer.decode(tokens[start:end])
                 
-                # 4. Highlight the exact token that caused the neuron to fire
                 trigger_token = tokenizer.decode(tokens[i_val])
                 
-                # Format it nicely for the terminal
-                neuron_contexts.append(f"...{context_str}  <-- [FIRED ON: '{trigger_token}']")
+                neuron_contexts.append(f"{context_str} AND {trigger_token}")
                 
             results[n] = neuron_contexts
             
@@ -309,7 +295,7 @@ for m_bottleneck in m:
             B, T, D = acts.shape
 
             flat = acts.view(-1, D)
-            _, sparse_feats = sae_model(flat)
+            sparse_feats = sae_model.encode(flat)
 
             Z_batch = sparse_feats.view(B, T, -1)
             batch_min = sparse_feats.amin(dim=(0,1))   # shape [D]
@@ -329,13 +315,16 @@ for m_bottleneck in m:
     print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
 
 
-    bit_configs = [6, 4, 2, None]
+    if m_bottleneck == 512:
+        bit_configs = [8]
+    elif m_bottleneck == 1024:
+        bit_configs = [8, 4, 2, None]
+        
     modes = ["per_tensor"]
     umap_data = {
         "Baseline": [],
         'per_tensor': {
         "8-bit_per_tensor": [],
-        "6-bit_per_tensor": [],
         "4-bit_per_tensor": [],
         "2-bit_per_tensor": []
         }
@@ -351,7 +340,7 @@ for m_bottleneck in m:
 
             wandb.init(
             project="sae-quantization-pt2",
-            name=f"{mode}_{label}_analysis",
+            name=f"{mode}_{label}_analysis_{m_bottleneck}",
             reinit=True
             )
             label = f"{bits}-bit" if bits else "Baseline"
@@ -369,7 +358,7 @@ for m_bottleneck in m:
                     B, T, D = clean_acts.shape
 
                     flat = clean_acts.view(-1, D)
-                    _, sparse_feats = sae_model(flat)
+                    sparse_feats = sae_model.encode(flat)
 
                     Z_batch = sparse_feats.view(B, T, -1)
                     if bits is not None:
@@ -390,7 +379,7 @@ for m_bottleneck in m:
                     Z_hat_all.append(Z_hat)
                     tokens_all.append(batch.view(-1))
 
-                    recon_acts = sae_model.decoder(Z_hat_batch)
+                    recon_acts = sae_model.decode(Z_hat_batch)
                     
                     Z_hat_np = (Z_hat.detach().cpu().numpy())
                     if bits is None: umap_data["Baseline"].append(Z_hat_np)

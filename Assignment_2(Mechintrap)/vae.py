@@ -115,9 +115,6 @@ for m_bottleneck in m:
         if step % 10 == 0:
             print(f"Step {step+resume_step} | SAE Loss (MSE): {loss.item():.4f}")
 
-        # if step >= 200: 
-        #     print("Debug pass complete!")
-        #     break
 
         if step > 0 and step % 5000 == 0:
             ckpt_path = f"./vae_checkpoints_64/sae_m{m_bottleneck}_step{step+resume_step}_64.pt"

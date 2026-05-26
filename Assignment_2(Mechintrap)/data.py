@@ -1,10 +1,4 @@
 import huggingface_hub
-
-if not hasattr(huggingface_hub, "split_torch_state_dict_into_shards"):
-    def dummy(*args, **kwargs):
-        return None
-    huggingface_hub.split_torch_state_dict_into_shards = dummy
-
 from transformer_lens import HookedTransformer
 from datasets import load_dataset
 import torch
@@ -14,106 +8,97 @@ from tqdm.auto import tqdm
 import os
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+import torch
+from sae_lens import (
+    LanguageModelSAERunnerConfig,
+    LanguageModelSAETrainingRunner,
+    TopKTrainingSAEConfig,
+    LoggingConfig,              
+)
 
-model = HookedTransformer.from_pretrained("distilgpt2")
-model.to(device)
-model.eval()
+cfg_512 = LanguageModelSAERunnerConfig(
+    model_name="distilgpt2",
+    hook_name="blocks.2.hook_resid_pre",
+    dataset_path="Skylion007/openwebtext",
+    is_dataset_tokenized=False,
+    streaming=True,
+    context_size=128,
 
-tokenizer = model.tokenizer
-hook_point = "blocks.2.hook_resid_pre"
+    training_tokens=int(100e6),
+    train_batch_size_tokens=4096,
+    lr=1e-4,
+    lr_scheduler_name="constant",
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    n_batches_in_buffer=32,
+    store_batch_size_prompts=16,
 
-class TopKSAE(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=512, k_percent=0.10):
-        super().__init__()
-        self.encoder = nn.Linear(input_dim, hidden_dim)
-        self.decoder = nn.Linear(hidden_dim, input_dim)
-        self.k = int(hidden_dim * k_percent)
+    logger=LoggingConfig(
+        log_to_wandb=True,
+        wandb_project="sae-quantization-final",
+        wandb_log_frequency=50,
+        eval_every_n_wandb_logs=10,
+        wandb_run_id="m512_run1",                
+    ),
+    n_checkpoints=10,
+    checkpoint_path="./sae_checkpoints_saelens/m512",
+    device="cuda",
+    seed=67,
 
-    def forward(self, x):
-        encoded = self.encoder(x)
-        topk_values, topk_indices = torch.topk(encoded, self.k, dim=-1)
-        sparse_encoded = torch.zeros_like(encoded)
-        sparse_encoded.scatter_(-1, topk_indices, topk_values)
-        reconstructed = self.decoder(sparse_encoded)
-        return reconstructed, sparse_encoded
+    sae=TopKTrainingSAEConfig(
+        d_in=768,
+        d_sae=512,
+        k=51,                                              
+        normalize_activations="expected_average_only_in",   
+    )
+)
 
-os.makedirs("./sae_checkpoints_64", exist_ok=True)
+print("=" * 60)
+print("Training m=512 SAE")
+print("=" * 60)
+runner_512 = LanguageModelSAETrainingRunner(cfg_512)
+sae_512 = runner_512.run()
 
-sae_512 = TopKSAE(input_dim=768, hidden_dim=512).to(device)
-sae_1024 = TopKSAE(input_dim=768, hidden_dim=1024).to(device)
+cfg_1024 = LanguageModelSAERunnerConfig(
+    model_name="distilgpt2",
+    hook_name="blocks.2.hook_resid_pre",
+    dataset_path="Skylion007/openwebtext",
+    is_dataset_tokenized=False,
+    streaming=True,
+    context_size=128,
 
-opt_512 = optim.Adam(sae_512.parameters(), lr=1e-4)
-opt_1024 = optim.Adam(sae_1024.parameters(), lr=1e-4)
+    training_tokens=int(100e6),
+    train_batch_size_tokens=4096,
+    lr=1e-4,
+    lr_scheduler_name="constant",
+    adam_beta1=0.9,
+    adam_beta2=0.999,
+    n_batches_in_buffer=32,
+    store_batch_size_prompts=16,
 
-criterion = nn.MSELoss()
-scaler = torch.amp.GradScaler('cuda')
+    logger=LoggingConfig(
+        log_to_wandb=True,
+        wandb_project="sae-quantization-final",
+        wandb_log_frequency=50,
+        eval_every_n_wandb_logs=10,
+    ),
+    n_checkpoints=10,
+    checkpoint_path="./sae_checkpoints_saelens/m1024",
+    device="cuda",
+    seed=67,
 
-dataset = load_dataset("openwebtext", split="train", streaming=True)
+    sae=TopKTrainingSAEConfig(
+        d_in=768,
+        d_sae=1024,
+        k=102, 
+        normalize_activations="expected_average_only_in",
+    )
+)
 
-def get_activation_batches(dataset, batch_size=128, seq_len=128):
-    batch_texts = []
-    token_buffer = []
-    for example in dataset:
-        tokens = tokenizer(example["text"])["input_ids"]
-        token_buffer.extend(tokens)
-        
-        while len(token_buffer) >= seq_len:
-            chunk = token_buffer[:seq_len]
-            token_buffer = token_buffer[seq_len:]
-            batch_texts.append(torch.tensor(chunk).unsqueeze(0)) 
+print("=" * 60)
+print("Training m=1024 SAE")
+print("=" * 60)
+runner_1024 = LanguageModelSAETrainingRunner(cfg_1024)
+sae_1024 = runner_1024.run()
 
-            if len(batch_texts) == batch_size:
-                yield torch.cat(batch_texts, dim=0)
-                batch_texts = []
-
-dataset_loader = get_activation_batches(dataset, batch_size=64) # Increased batch size
-
-for step, batch_loaded in enumerate(dataset_loader):
-    batch_loaded = batch_loaded.to(device)
-
-    # A. Run the heavy LLM pass ONCE
-    with torch.no_grad():
-        _, cache = model.run_with_cache(batch_loaded, names_filter=[hook_point])
-        layer_3_acts = cache[hook_point].detach()
-    
-    flat_acts = layer_3_acts.view(-1, 768).to(torch.float32)
-    mean = flat_acts.mean(dim=0, keepdim=True)
-    std = flat_acts.std(dim=0, keepdim=True)
-    normalized_acts = (flat_acts - mean) / (std + 1e-5)
-    
-    shuffle_indices = torch.randperm(normalized_acts.size(0), device=device)
-    shuffled_acts = normalized_acts[shuffle_indices]
-
-    opt_512.zero_grad(set_to_none=True)
-    with torch.autocast(device_type='cuda', dtype=torch.float16):
-        recon_512, _ = sae_512(shuffled_acts)
-        loss_512 = criterion(recon_512, shuffled_acts)
-    scaler.scale(loss_512).backward()
-    scaler.step(opt_512)
-
-    # D. Update Model 2 (1024)
-    opt_1024.zero_grad(set_to_none=True)
-    with torch.autocast(device_type='cuda', dtype=torch.float16):
-        recon_1024, _ = sae_1024(shuffled_acts)
-        loss_1024 = criterion(recon_1024, shuffled_acts)
-    scaler.scale(loss_1024).backward()
-    scaler.step(opt_1024)
-    
-    scaler.update()
-
-    # Logging
-    if step % 50 == 0:
-        print(f"Step {step} | Loss 512: {loss_512.item():.4f} | Loss 1024: {loss_1024.item():.4f}")
-
-    if step > 0 and step % 5000 == 0:
-        torch.save(sae_512.state_dict(), f"./sae_checkpoints_64/sae_m512_step{step}.pt")
-        torch.save(sae_1024.state_dict(), f"./sae_checkpoints_64/sae_m1024_step{step}.pt")
-        tqdm.write(f"--> Checkpoints saved at step {step}")
-
-    if step >= 100000: 
-        break
-
-# Final Save
-torch.save(sae_512.state_dict(), "./sae_m512_final_tl_100k.pt")
-torch.save(sae_1024.state_dict(), "./sae_m1024_final_tl_100k.pt")
-print("Training Complete!")
+print("Training complete. Both SAEs saved.")
