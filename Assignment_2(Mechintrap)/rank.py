@@ -15,7 +15,6 @@ from datasets import load_dataset
 import json
 
 from sae_lens import SAE
-
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = HookedTransformer.from_pretrained("distilgpt2", device=device)
@@ -450,10 +449,15 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
                         "tokens": toks[:k],
                         "l2_score": l2[n].item()
                     }
-            with open(f"top_kl_{bits}bit_m_{m_bottleneck}.json", "w") as f:
+            BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+            save_dir = os.path.join(BASE_DIR, "Neurons_ranked")
+            os.makedirs(save_dir, exist_ok=True)
+
+            with open(os.path.join(save_dir,f"top_kl_{bits}bit_m_{m_bottleneck}.json"),"w") as f:
                 json.dump(ranked_kl_data, f, indent=2)
 
-            with open(f"top_l2_{bits}bit_m_{m_bottleneck}.json", "w") as f:
+            with open(os.path.join(save_dir, f"top_l2_{bits}bit_m_{m_bottleneck}.json"),"w") as f:
                 json.dump(ranked_l2_data, f, indent=2)
             global_ablation = run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=m_bottleneck)
 
