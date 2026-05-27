@@ -25,7 +25,7 @@ checkpoint_paths = {
 }
 
 loaded_saes = {}
-for k_sds in [32,64,128]:
+for k_sds in [32]:
     for m_bottleneck, folder_path in checkpoint_paths.items():
         print(f"Loading SAELens model for m={m_bottleneck}...")
         
@@ -312,7 +312,7 @@ for k_sds in [32,64,128]:
         
         Vk_global = compute_importance(k=0.3)
         
-        bit_configs = [16, 8, 6, 4, 2, None]
+        bit_configs = [16, 8, 4, 2, None]
 
         modes = ["subspace", "per_tensor"]
         umap_data = {
@@ -320,14 +320,12 @@ for k_sds in [32,64,128]:
             'per_tensor': {
             "16-bit_per_tensor": [],
             "8-bit_per_tensor": [],
-            "6-bit_per_tensor": [],
             "4-bit_per_tensor": [],
             "2-bit_per_tensor": []
             },
             'subspace': {
             "16-bit_subspace": [],
             "8-bit_subspace": [],
-            "6-bit_subspace": [],
             "4-bit_subspace": [],
             "2-bit_subspace": []
             }
@@ -353,9 +351,6 @@ for k_sds in [32,64,128]:
                         bit=bits,
                         tensor=Z
                     )
-
-                    # preserve exact sparsity
-                    Z_hat = Z_hat * (Z != 0).float()
                     
                 elif mode == "subspace":
                     Z_flat = Z.view(-1, Z.size(-1))
@@ -547,7 +542,7 @@ for k_sds in [32,64,128]:
                     
                 wandb.log({
                     "bit_high": 16,
-                    "k_value": k,
+                    "k_value": k_sds,
                     "Perplexity": ppl,
                     "jacobian_mean": jacobian.mean().item(),
                     "fisher_mean": fisher.mean().item(),

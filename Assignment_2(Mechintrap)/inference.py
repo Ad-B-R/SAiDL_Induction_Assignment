@@ -185,6 +185,41 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
     def normalize(x):
         return x / (np.linalg.norm(x, axis=1, keepdims=True) + 1e-9)
 
+    print("\nEvaluating: Clean model (no SAE intervention)")
+    total_loss_clean = 0
+
+    def identity_hook(activations, hook):
+        return activations  
+
+    with torch.no_grad():
+        for batch in tqdm(eval_batches, leave=False):
+            logits = model.run_with_hooks(
+                batch,
+                fwd_hooks=[("blocks.2.hook_resid_pre", identity_hook)]
+            )
+            loss = model.loss_fn(logits, batch)
+            total_loss_clean += loss.item()
+
+    clean_ppl = math.exp(total_loss_clean / len(eval_batches))
+    print(f"Clean model PPL (no SAE): {clean_ppl:.2f}")
+
+    wandb.init(
+        project="sae-quantization",
+        name=f"clean_model_no_sae_{m_bottleneck}",
+        config={
+            "model": "distilgpt2",
+            "layer": 3,
+            "sae_bottleneck": m_bottleneck, 
+            "k_percent": 0.10,
+            "seq_len": 128,
+            "model_batch": 32,
+            "mode": "no_sae",                
+            "bits": None,                     
+        },
+        reinit=True
+    )
+    wandb.log({"clean_model_ppl": clean_ppl})
+
     for mode in modes:
         print(f"\nMode: {mode}")
 
@@ -207,13 +242,13 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
                 },
                 reinit=True
             )
-            total_loss, total_mse, total_sds, total_cka = 0, 0, 0, 0
+            total_loss, total_mse, total_sds = 0, 0, 0
+            total_sds_128, total_sds_64, total_cka = 0, 0, 0
             Z_all = []
             Z_hat_all = []
             with torch.no_grad():
                 idx = 0
                 for batch in tqdm(eval_batches, leave=False):
-                    # 1. This single pass fires the hook, computes PPL, and populates the cache
                     logits = model.run_with_hooks(
                         batch,
                         fwd_hooks=[("blocks.2.hook_resid_pre", hook_fn)]
@@ -222,7 +257,6 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
                     loss = model.loss_fn(logits, batch)
                     total_loss += loss.item()
 
-                    # 2. Extract our perfectly synchronized tensors
                     clean_acts = hook_cache['clean_acts']
                     recon_acts = hook_cache['recon_acts']
                     Z_batch = hook_cache['Z']
@@ -254,9 +288,9 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
                             "perplexity": math.exp(total_loss/(idx+1)),
                             "mse": total_mse / (idx+1) if bits is not None else 0,
                             "cka": total_cka / (idx+1) if bits is not None else 0,
-                            "sds": total_sds / (idx+1) if bits is not None else 0
-                            "sds_64": total_sds_64 / (idx+1) if bits is not None else 0
-                            "sds_128": total_sds_128 / (idx+1) if bits is not None else 0
+                            "sds": total_sds / (idx+1) if bits is not None else 0,
+                            "sds_64": total_sds_64 / (idx+1) if bits is not None else 0,
+                            "sds_128": total_sds_128 / (idx+1) if bits is not None else 0,
                         })
                     idx += 1
             Z_full = torch.cat(Z_all)
@@ -266,8 +300,8 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
             global_sds_64 = SDS(Z_full, Z_hat_full, k=64)
             global_sds_128 = SDS(Z_full, Z_hat_full, k=128)
             wandb.log({
-                "global_sds_64": global_sds_64
-                "global_sds_128": global_sds_128
+                "global_sds_64": global_sds_64,
+                "global_sds_128": global_sds_128,
                 "global_sds": global_sds
             })
             avg_loss = total_loss / len(eval_batches)
@@ -277,20 +311,17 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
                 print(f"MSE: {total_mse / len(eval_batches):.4f}")
 
             wandb.finish()
-
+    
     print("Running UMAP...")
     for mode in modes:
         reducer = umap.UMAP(metric='euclidean', min_dist=0.1, random_state=67)
         
-        # Grab the baseline from the TOP level of the dictionary
         baseline = np.concatenate(umap_data["Baseline"], axis=0)
         baseline = baseline.reshape(-1, baseline.shape[-1])[:10000]
 
-        # Fit the reducer ONLY to the continuous baseline
         reducer.fit(baseline)
         baseline_2d = reducer.transform(baseline)
 
-        # 5 subplots for [Baseline, 8, 6, 4, 2]
         fig, axes = plt.subplots(1, 5, figsize=(25, 5))
         fig.suptitle(f"UMAP Grid Collapse ({mode})", fontsize=16)
 
@@ -302,10 +333,9 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
             if label == "Baseline":
                 data_list = umap_data["Baseline"]
             else:
-                # Reconstruct the exact dictionary key (e.g., "8-bit_per_tensor")
                 dict_key = f"{label}_{mode}" 
                 if dict_key not in umap_data[mode]: 
-                    continue # Skip if this bit configuration didn't run
+                    continue # 
                 data_list = umap_data[mode][dict_key]
                 
             # 2. Process the data

@@ -12,6 +12,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import math
 import wandb
 from datasets import load_dataset
+import json
 
 from sae_lens import SAE
 
@@ -147,80 +148,85 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
         }
 
     def run_subset_ablation(model, sae_model, eval_batches, neurons, device):
-        def compute_loss_with_hook(hook_fn=None):
-            total_loss = 0
-            with torch.no_grad():
-                for batch in eval_batches:
-                    if hook_fn is None:
-                        logits = model(batch)
-                        loss = model.loss_fn(logits, batch)
-                    else:
-                        logits = model.run_with_hooks(
-                            batch,
-                            fwd_hooks=[("blocks.2.hook_resid_pre", hook_fn)]
-                        )
-                        loss = model.loss_fn(logits, batch)
 
-                    total_loss += loss.item()
-            return math.exp(total_loss / len(eval_batches))
+        batch_cache = []
+        with torch.no_grad():
+            for batch in eval_batches:
+                _, cache = model.run_with_cache(batch, names_filter="blocks.2.hook_resid_pre")
+                acts = cache["blocks.2.hook_resid_pre"]
+                feats = sae_model.encode(acts.view(-1, acts.size(-1))).view(*acts.shape[:2], -1)
+                batch_cache.append((batch, feats))
 
-        baseline_ppl = compute_loss_with_hook()
 
-        def hook_fn(activations, hook):
-            B, T, D = activations.shape
-            flat = activations.view(-1, D)
-            feats = sae_model.encode(flat)
-            feats = feats.view(B, T, -1)
+        total_baseline_loss = 0
+        with torch.no_grad():
+            for batch, _ in batch_cache:
+                total_baseline_loss += model(batch, return_type="loss").item()
+        baseline_ppl = math.exp(total_baseline_loss / len(batch_cache))
 
-            ablated_acts = activations.clone()
-            
-            for n in neurons:
-                neuron_act = feats[..., n].unsqueeze(-1)
-                neuron_dir = sae_model.W_dec[n, :].view(1, 1, D)
-                ablated_acts = ablated_acts - (neuron_act * neuron_dir)
+        total_ablated_loss = 0
+        with torch.no_grad():
+            for batch, cached_feats in batch_cache:
+                
+                def hook_fn(activations, hook):
+                    ablated_acts = activations.clone()
+                    for n in neurons:
+                        neuron_act = cached_feats[..., n].unsqueeze(-1)
+                        neuron_dir = sae_model.W_dec[n, :].view(1, 1, -1)
+                        ablated_acts -= (neuron_act * neuron_dir)
+                    return ablated_acts
 
-            return ablated_acts
+                loss = model.run_with_hooks(
+                    batch,
+                    return_type="loss",
+                    fwd_hooks=[("blocks.2.hook_resid_pre", hook_fn)]
+                )
+                total_ablated_loss += loss.item()
 
-        ablated_ppl = compute_loss_with_hook(hook_fn)
+        ablated_ppl = math.exp(total_ablated_loss / len(batch_cache))
         return (ablated_ppl - baseline_ppl) / abs(baseline_ppl + 1e-9)
 
     def run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=512):
-    
         results = {}
 
-        def compute_ppl_with_hook(hook_fn=None):
-            total_loss = 0
-            with torch.no_grad():
-                for batch in eval_batches:
-                    if hook_fn is None:
-                        logits = model(batch)
-                        loss = model.loss_fn(logits, batch)
-                    else:
-                        logits = model.run_with_hooks(
-                            batch,
-                            fwd_hooks=[("blocks.2.hook_resid_pre", hook_fn)]
-                        )
-                        loss = model.loss_fn(logits, batch)
-                    total_loss += loss.item()
-            return math.exp(total_loss / len(eval_batches))
+        batch_cache = []
+        with torch.no_grad():
+            for batch in eval_batches:
+                _, cache = model.run_with_cache(batch, names_filter="blocks.2.hook_resid_pre")
+                acts = cache["blocks.2.hook_resid_pre"]
+                
+                # Encode and reshape
+                feats = sae_model.encode(acts.view(-1, acts.size(-1))).view(*acts.shape[:2], -1)
+                
+                batch_cache.append((batch, feats))
 
-        baseline_ppl = compute_ppl_with_hook()
+        total_baseline_loss = 0
+        with torch.no_grad():
+            for batch, _ in batch_cache:
+                loss = model(batch, return_type="loss")
+                total_baseline_loss += loss.item()
+        baseline_ppl = math.exp(total_baseline_loss / len(batch_cache))
 
         for n in tqdm(range(m_bottleneck), desc="Ablating Neurons", leave=False):
-            def hook_fn(activations, hook, neuron=n):
-                B, T, D = activations.shape
-                flat = activations.view(-1, D)
-                feats = sae_model.encode(flat)
-                feats = feats.view(B, T, -1)
+            total_loss = 0
+            
+            neuron_dir = sae_model.W_dec[n, :].view(1, 1, -1)
 
-                neuron_act = feats[..., neuron].unsqueeze(-1) # [B, T, 1]
-                neuron_dir = sae_model.W_dec[n, :].view(1, 1, D)                
-                # Subtract from the ORIGINAL activations
-                ablated_acts = activations - (neuron_act * neuron_dir)
+            for batch, cached_feats in batch_cache:
+                
+                def hook_fn(activations, hook):
+                    neuron_act = cached_feats[..., n].unsqueeze(-1) # [B, T, 1]
+                    return activations - (neuron_act * neuron_dir)
 
-                return ablated_acts
-
-            ablated_ppl = compute_ppl_with_hook(hook_fn)
+                with torch.no_grad():
+                    loss = model.run_with_hooks(
+                        batch,
+                        return_type="loss",
+                        fwd_hooks=[("blocks.2.hook_resid_pre", hook_fn)]
+                    )
+                    total_loss += loss.item()
+                    
+            ablated_ppl = math.exp(total_loss / len(batch_cache))
             results[n] = (ablated_ppl - baseline_ppl) / abs(baseline_ppl + 1e-9)
 
         return results
@@ -315,10 +321,7 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
     print(f"Calibration Complete | Min: {global_min:.4f}, Max: {global_max:.4f}")
 
 
-    if m_bottleneck == 512:
-        bit_configs = [8]
-    elif m_bottleneck == 1024:
-        bit_configs = [8, 4, 2, None]
+    bit_configs = [8, 4, 2, None]
         
     modes = ["per_tensor"]
     umap_data = {
@@ -430,12 +433,28 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
 
             print("\nTop KL neurons + tokens:")
             for n, toks in top_tokens_kl.items():
-                print(f"Neuron {n}: {toks[:k]}")
-
+                ranked_kl_data = {}
+                for rank, (n, toks) in enumerate(top_tokens_kl.items(), 1):
+                    ranked_kl_data[n] = {
+                        "rank": rank,
+                        "tokens": toks[:k],
+                        "kl_score": kl[n].item()
+                    }
             print("\nTop L2 neurons + tokens:")
             for n, toks in top_tokens_l2.items():
-                print(f"Neuron {n}: {toks[:k]}")
+                ranked_l2_data = {}
 
+                for rank, (n, toks) in enumerate(top_tokens_l2.items(), 1):
+                    ranked_l2_data[n] = {
+                        "rank": rank,
+                        "tokens": toks[:k],
+                        "l2_score": l2[n].item()
+                    }
+            with open(f"top_kl_{bits}bit_m_{m_bottleneck}.json", "w") as f:
+                json.dump(ranked_kl_data, f, indent=2)
+
+            with open(f"top_l2_{bits}bit_m_{m_bottleneck}.json", "w") as f:
+                json.dump(ranked_l2_data, f, indent=2)
             global_ablation = run_global_ablation(model, sae_model, eval_batches, device, m_bottleneck=m_bottleneck)
 
             random_neurons = random.sample(range(len(l2)), k)
