@@ -1,7 +1,6 @@
 wandb
 outputs
 __pycache__
-.vscode
 run_all.py
 main.tex
 test.py
@@ -15,3 +14,6 @@ clean_env/
 tea_debug.log
 sae_checkpoints_saelens/
 output/
+.vscode/
+settings.json
+weights

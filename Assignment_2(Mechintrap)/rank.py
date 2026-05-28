@@ -258,7 +258,6 @@ for m_bottleneck, folder_path in checkpoint_paths.items():
     def get_top_tokens_with_context(Z, tokens, neurons, k=10, context_size=3):
         results = {}
         
-        # 1. Mask out the padding tokens so we don't get <|endoftext|> spam
         pad_id = tokenizer.eos_token_id
         valid_mask = (tokens != pad_id)
         
