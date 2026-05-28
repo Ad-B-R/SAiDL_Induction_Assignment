@@ -32,6 +32,7 @@ configurations = [
     (4, 4),         # joint 4-bit
     (None, 2),      # SAE 2-bit only
     (2, 2),         # joint 2-bit
+    (2, None)       # model 2-bit only
 ]
 
 def quantize_gen(min_, max_, bit, tensor):
