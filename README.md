@@ -7,6 +7,9 @@
 - GitHub Repository: https://github.com/Ad-B-R/SAiDL_Induction_Assignment
 
 - [Project Report (PDF)](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/blob/main/main.pdf)
+- [Assignment 1- Core ML](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/tree/main/Assignment_1(Core_ML))
+
+- [Assignment 2- Mechanistic Interpretability](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/tree/main/Assignment_2(Mechintrap))
 
 # Assignment 1: Core ML
 - Core-ML Assignment tackles the empirical study of different attention variants and their performance. 
@@ -41,35 +44,35 @@ perform experiments and study the impact on different metrics (such as perplexit
 
 ```text
 Assignment_1(Core_ML)/
-├── attention/
+├── attention/ # Attention Mechanism
 │   ├── baseline.py
 │   ├── GQA.py
 │   ├── Sliding_Window.py
 │   └── Softmax.py
 │
-├── Bonus/
+├── Bonus/ # AFT Mechanism 
 │   ├── AFT_conv.py
 │   ├── AFT_full.py
 │   ├── AFT_local.py
 │   ├── AFT_simple.py
 │   ├── config.yaml
 │   ├── data.py
-│   └── run.py
+│   └── run.py # Runs all AFT Mechanisms
 │
-├── convolution-Attention/
-│   ├── conformer.py
-│   ├── conv.py
-│   ├── data_conv.py
-│   ├── model_conv.py
-│   └── config.yaml
+├── convolution-Attention/ # Conformer Mechanism
+│   ├── conformer.py # Conformer
+│   ├── conv.py # Convolution layer
+│   ├── data_conv.py 
+│   ├── model_conv.py # Runs both the Conformer Mechanism
+│   └── config.yaml # Config
 │
-├── positional/
+├── positional/ # Positional 
 │   ├── alibi.py
 │   ├── rope.py
 │   ├── tpe.py
 │   └── standardpos.py
 │
-├── conf/
+├── conf/ # config files
 │   ├── attention/
 │   │   ├── GQA.yaml
 │   │   ├── Sliding.yaml
@@ -81,13 +84,12 @@ Assignment_1(Core_ML)/
 │   │   └── Standard.yaml
 │   └── config.yaml
 │
-├── data.py
-├── model_alibi.py
-├── model_rope.py
-├── model_rpe.py
-├── model_scale_rope.py
-├── model_std.py
-└── requirements.txt
+├── data.py # Script to import dataset
+├── model_alibi.py # Run ALiBi
+├── model_rope.py # Run RoPE
+├── model_rpe.py # Run RPE
+├── model_scale_rope.py # Scaled RoPE
+├── model_std.py # Run Baseline Positional Encoding 
 ```
 
 # Assignment 2: Mechanistic Interpretability
@@ -121,14 +123,13 @@ schemes damage the learned sparse representations.
 
 ```text
 Assignment_2(Mechintrap)/
-├── data.py 
-├── vae.py 
-├── inference.py 
-├── rank.py 
-├── joint_quant.py 
-├── robust_quant.py 
-├── robust_vae.py 
-├── train_vae.py 
-└── Neurons_ranked/ 
+├── data.py # Train SAE
+├── vae.py # Train VAE
+├── inference.py # Representation Damage Experiment
+├── rank.py # Ranking Neurons Experiment
+├── joint_quant.py # Joint Quantisation Experiment
+├── robust_quant.py # Robust Quantisation incorporating Subspace Quantisation
+├── robust_vae.py # VAE Representation Damage
+└── Neurons_ranked/ # Top Neurons Ranked
     ├── ...
 ```

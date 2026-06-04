@@ -55,7 +55,7 @@ for m_bottleneck in m:
 
     weights_folder = os.path.join(parent_dir, "vae_checkpoints_64")
 
-    model_file_name = f"sae_m{m_bottleneck}_step{20000}_64.pt"
+    model_file_name = f"sae_m{m_bottleneck}_step{12000}_64.pt"
 
     final_weights_path = os.path.join(weights_folder, model_file_name)
     vae_model.load_state_dict(torch.load(final_weights_path, map_location=device))
@@ -197,29 +197,30 @@ for m_bottleneck in m:
     def get_quant_hook(mode, bits, vae_model, feature_min, feature_max):
         low  = feature_min.view(1, 1, -1)
         high = feature_max.view(1, 1, -1)
-        
+
         def hook_fn(acts, hook):
-            _, Z, _, _ = vae_model(acts)
-            
+            # 1. normalize into the space the VAE was trained in (match training: per-feature over tokens)
+            flat = acts.view(-1, acts.size(-1))
+            mean = flat.mean(dim=0, keepdim=True)
+            std  = flat.std(dim=0, keepdim=True)
+            x_norm = (acts - mean) / (std + 1e-5)
+
+            # 2. encode
+            _, Z, _, _ = vae_model(x_norm)
+
+            # 3. quantize latent
             if bits is None:
-                return acts
-            
-            if mode == "per_tensor":
-                Z_flat   = Z.view(-1, Z.size(-1))
-                Z_hat_flat = quantize_gen(
-                    min=low.view(-1, low.size(-1)),
-                    max=high.view(-1, high.size(-1)),
-                    bit=bits,
-                    tensor=Z_flat
-                )
-                Z_hat = Z_hat_flat.view_as(Z)
+                Z_hat = Z
+            elif mode == "per_tensor":
+                Z_hat = quantize_gen(min=low, max=high, bit=bits, tensor=Z)
             else:
                 raise ValueError(mode)
-            
-            recon = vae_model.decoder(Z_hat)
+
+            recon_norm = vae_model.decoder(Z_hat)
+            recon = recon_norm * (std + 1e-5) + mean
             return recon
-        
-        return hook_fn
+        return hook_fn   
+     
     def compute_ppl_with_hook(model, eval_batches, hook_fn):
         total_loss = 0
 

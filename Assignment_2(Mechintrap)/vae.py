@@ -19,7 +19,7 @@ tokenizer = model.tokenizer
 # Hook point (layer 3 input)
 hook_point = "blocks.2.hook_resid_pre"
 
-resume_step = 10000
+resume_step = 0
 dataset = load_dataset("openwebtext", split="train", streaming=True)
 skip_dataset = dataset.skip(resume_step)
 
@@ -63,13 +63,13 @@ class VAE(nn.Module):
         if self.training:
             z = self.reparam(mu, logvar)
         else:
-            z = mu   
+            z = self.reparam(mu, logvar)   
         recon = self.decoder(z)
         return recon, z, mu, logvar
     
 def vae_loss(x, recon, mu, logvar, beta=0.01):
-    recon_loss = nn.MSELoss()(recon, x)
-    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    recon_loss = ((x - recon) ** 2).sum(dim=-1).mean()
+    kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1).mean()
     return recon_loss + beta * kl
 
 # model(dummy_input)
@@ -119,13 +119,13 @@ for m_bottleneck in m:
             print(f"Step {step+resume_step} | SAE Loss (MSE): {loss.item():.4f}")
 
 
-        if step > 0 and step % 5000 == 0:
+        if step > 0 and step % 12000 == 0:
             ckpt_path = f"./vae_checkpoints_64/sae_m{m_bottleneck}_step{step+resume_step}_64.pt"
             torch.save(vae_model.state_dict(), ckpt_path)
             tqdm.write(f"--> Checkpoint saved: {ckpt_path}")
         
-        # Stop exactly at 100,000 as requested
-        if step >= 100000: 
+        # Stop exactly at 12,000 as requested
+        if step >= 12000: 
             print("\nTraining Complete!")
             break
 
