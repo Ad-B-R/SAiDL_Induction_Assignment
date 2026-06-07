@@ -130,6 +130,10 @@ Assignment_2(Mechintrap)/
 ├── joint_quant.py # Joint Quantisation Experiment
 ├── robust_quant.py # Robust Quantisation incorporating Subspace Quantisation
 ├── robust_vae.py # VAE Representation Damage
+├── Umap Ranking/ # Umap Ranking for damage geomterically
+│   ├── ...
+├── SVD Ranking/ # SVD Ranking for Representation damage 
+│   ├── ...
 └── Neurons_ranked/ # Top Neurons Ranked
     ├── ...
 ```
