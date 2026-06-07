@@ -6,7 +6,7 @@
 
 - GitHub Repository: https://github.com/Ad-B-R/SAiDL_Induction_Assignment
 
-- [Project Report (PDF)](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/blob/main/main.pdf)
+- [Project Report (PDF)](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/blob/main/Report.pdf)
 - [Assignment 1- Core ML](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/tree/main/Assignment_1(Core_ML))
 
 - [Assignment 2- Mechanistic Interpretability](https://github.com/Ad-B-R/SAiDL_Induction_Assignment/tree/main/Assignment_2(Mechintrap))
